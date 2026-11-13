@@ -157,7 +157,7 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
         allow_origins=settings.cors_origins,
         allow_methods=["GET", "POST"],
         allow_headers=["Authorization", "Content-Type"],
-        expose_headers=["X-Request-ID"],
+        expose_headers=["X-Request-ID", "X-Conversation-ID"],
     )
     app.state.service = service
 
@@ -248,6 +248,7 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
             first = await connected(request, session.next())
             if first[0] == "error":
                 raise first[1]
+            headers["X-Conversation-ID"] = body.conversation_id
             if not body.stream:
 
                 async def collect():

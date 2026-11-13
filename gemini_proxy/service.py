@@ -3,6 +3,7 @@ import logging
 import time
 from contextlib import aclosing, asynccontextmanager
 
+from .conversations import Conversations, fingerprints
 from .errors import ProxyError
 from .prompts import build_prompt, parse_tool_output, repair_prompt, tool_mode
 
@@ -16,6 +17,7 @@ class Service:
         self.browser = browser
         self.lock = asyncio.Lock()
         self.waiting = 0
+        self.conversations = Conversations(settings.conversation_file, settings.max_conversations)
 
     async def abort_backend(self, backend):
         try:
@@ -58,13 +60,15 @@ class Service:
                 raise
             return await self.browser.models()
 
-    async def select(self, model, request_id):
-        candidate = self.cookie
+    async def select(self, model, request_id, entry=None):
+        candidate = self.cookie if entry is None or entry["backend"] == "cookie" else self.browser
+        if candidate is None:
+            raise ProxyError("conversation_backend_unavailable", "Thread backend is disabled.", 503)
         try:
             try:
-                await candidate.prepare(model)
+                await candidate.prepare(model, entry["state"] if entry else None)
             except ProxyError as exc:
-                if not exc.safe_fallback or self.browser is None:
+                if entry is not None or not exc.safe_fallback or self.browser is None:
                     raise
                 log.info("request=%s fallback=cookie->browser reason=%s", request_id, exc.code)
                 candidate = self.browser
@@ -75,10 +79,10 @@ class Service:
             await self.abort_backend(candidate)
             raise
 
-    async def collect(self, backend, prompt, model):
+    async def collect(self, backend, prompt, model, state):
         pieces = []
         size = 0
-        async with aclosing(backend.stream(prompt, model)) as outputs:
+        async with aclosing(backend.stream(prompt, model, state)) as outputs:
             async for text in outputs:
                 size += len(text)
                 if size > self.settings.max_output_chars:
@@ -98,32 +102,60 @@ class Service:
             async with self.slot():
                 try:
                     async with asyncio.timeout(self.settings.request_timeout):
-                        backend = await self.select(request.model, request_id)
-                        prompt = build_prompt(request)
+                        entry, hashes = self.conversations.resolve(request)
+                        backend = await self.select(request.model, request_id, entry)
+                        start = len(entry["hashes"]) if entry else 0
+                        state = dict(entry["state"]) if entry else {}
+                        # Persist uncertainty before dispatch, including process crashes.
+                        entry = {
+                            "model": request.model,
+                            "backend": backend.name,
+                            "state": state,
+                            "hashes": entry["hashes"] if entry else hashes,
+                            "valid": False,
+                        }
+                        self.conversations.save(request.conversation_id, entry)
+                        prompt = build_prompt(request, start)
                         if tool_mode(request):
-                            raw = await self.collect(backend, prompt, request.model)
+                            raw = await self.collect(backend, prompt, request.model, state)
                             try:
                                 message = parse_tool_output(raw, request)
                             except ProxyError:
                                 # Intentional format repair only, never transport recovery.
-                                await backend.prepare(request.model)
+                                await backend.prepare(request.model, state)
                                 raw = await self.collect(
-                                    backend, repair_prompt(prompt, raw), request.model
+                                    backend,
+                                    repair_prompt(
+                                        build_prompt(request, len(request.messages)), raw
+                                    ),
+                                    request.model,
+                                    state,
                                 )
                                 message = parse_tool_output(raw, request)
+                            self.commit(request, entry, hashes, message)
                             yield "message", message
                         else:
                             size = 0
-                            async with aclosing(backend.stream(prompt, request.model)) as outputs:
+                            pieces = []
+                            async with aclosing(
+                                backend.stream(prompt, request.model, state)
+                            ) as outputs:
                                 async for text in outputs:
                                     size += len(text)
                                     if size > self.settings.max_output_chars:
                                         raise ProxyError(
                                             "output_too_large", "Output limit exceeded."
                                         )
+                                    pieces.append(text)
                                     yield "text", text
                             if not size:
                                 raise ProxyError("empty_response", "Gemini returned no text.")
+                            self.commit(
+                                request,
+                                entry,
+                                hashes,
+                                {"role": "assistant", "content": "".join(pieces)},
+                            )
                 except BaseException:
                     # Abort on failure/cancellation while holding the slot, before next request.
                     if backend is not None:
@@ -151,6 +183,12 @@ class Service:
                 (time.monotonic() - started) * 1000,
                 outcome,
             )
+
+    def commit(self, request, entry, hashes, message):
+        self.conversations.save(
+            request.conversation_id,
+            entry | {"hashes": hashes + fingerprints([message]), "valid": True},
+        )
 
     async def close(self):
         await self.cookie.close()

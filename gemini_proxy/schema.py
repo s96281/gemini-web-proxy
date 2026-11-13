@@ -89,6 +89,7 @@ class Tool(StrictModel):
 
 class ChatRequest(StrictModel):
     model: str = Field(min_length=1)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=256)
     messages: list[Message] = Field(min_length=1)
     stream: bool = False
     tools: list[Tool] = Field(default_factory=list, max_length=128)

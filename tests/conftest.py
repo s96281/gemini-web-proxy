@@ -24,19 +24,21 @@ class FakeBackend:
         self.aborted = 0
         self.active = 0
         self.max_active = 0
+        self.states = []
 
     async def models(self):
         if self.prepare_error:
             raise self.prepare_error
         return [Model("gemini-test", "Test")]
 
-    async def prepare(self, model):
+    async def prepare(self, model, state=None):
         self.prepared.append(model)
         if self.prepare_error:
             raise self.prepare_error
 
-    async def stream(self, prompt, model):
+    async def stream(self, prompt, model, state=None):
         self.prompts.append(prompt)
+        self.states.append(dict(state) if state is not None else None)
         response = self.responses.popleft()
         self.active += 1
         self.max_active = max(self.max_active, self.active)
@@ -47,6 +49,8 @@ class FakeBackend:
                 if isinstance(part, Exception):
                     raise part
                 yield part
+            if state is not None:
+                state["turn"] = state.get("turn", 0) + 1
         finally:
             self.active -= 1
 
@@ -64,6 +68,7 @@ def settings(tmp_path):
         api_key=KEY,
         cookie_file=tmp_path / "cookies.json",
         cookie_cache=tmp_path / "cache",
+        conversation_file=tmp_path / "conversations.json",
         browser_profile=tmp_path / "profile",
         browser_enabled=False,
         request_timeout=3,

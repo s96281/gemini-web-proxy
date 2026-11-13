@@ -2,9 +2,13 @@
 
 日期：2026-11-13（Asia/Taipei）。
 
-- `pytest -q`：48 passed；包含 OpenAI Python SDK、Cookie 適配層、真實 Chromium 操作本機 HTML fixture、工具往返、備援、逾時、排隊、取消與串流中斷。
+- `GP_BROWSER_EXECUTABLE=/usr/bin/chromium .venv/bin/pytest -q`：66 passed；包含 OpenAI Python SDK、Cookie 適配層、真實 Chromium 操作本機 HTML fixture、工具往返、備援、逾時、排隊、取消與串流中斷，以及非臨時對話的 metadata 保存、歷史前綴辨識、指定 conversation_id、重啟續接、同網址多輪生成、工具修復後續接、衝突／失敗狀態與保留上限。
 - `ruff check gemini_proxy tests examples`：通過。
 - `ruff format --check gemini_proxy tests examples`：通過。
+- `git diff --check`：通過。
+
+本次使用環境已安裝的 `/usr/bin/chromium`；Playwright 預設版本的瀏覽器執行檔未安裝，未以缺少執行檔的初次失敗判斷功能結果。以下為先前基線的 Docker 驗證，本次對話續接修改未重建映像：
+
 - Docker Compose 組態驗證：通過。
 - Docker 映像 `gemini-web-proxy:test`：建置通過。
 - 容器以預設非 root 使用者啟動：通過；已測試 live health 200、未提供 API Key 時 401、未配置 Cookie 且停用備援時 readiness 503。

@@ -57,6 +57,22 @@ async def test_browser_discovery_exact_model_and_incremental_generation(browser)
     )
 
 
+async def test_browser_reopens_saved_thread_and_waits_for_new_response(browser):
+    state = {}
+    await browser.prepare("web-fast")
+    assert "".join([s async for s in browser.stream("first", "web-fast", state)]) == "Hello browser"
+    saved_url = state["url"]
+    await browser.close()
+    await browser.prepare("web-fast", state)
+    assert browser.page.url == saved_url
+    assert await browser.page.locator("model-response").count() == 1
+    assert (
+        "".join([s async for s in browser.stream("second", "web-fast", state)]) == "Hello browser"
+    )
+    assert state["url"] == saved_url
+    assert await browser.page.locator("model-response").count() == 2
+
+
 async def test_browser_explicit_alias_and_no_silent_model_switch(browser):
     browser.settings.browser_model_map = {"gemini-flash": "Fast"}
     assert "gemini-flash" in {m.id for m in await browser.models()}

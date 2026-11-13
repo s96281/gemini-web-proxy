@@ -122,23 +122,28 @@ class CookieBackend:
         except Exception as exc:
             raise translate(exc, preflight=True) from None
 
-    async def prepare(self, model):
+    async def prepare(self, model, state=None):
         if model not in {m.id for m in await self.models()}:
             raise ProxyError("model_not_found", "Model is not available for this account.", 404)
 
-    async def stream(self, prompt, model):
+    async def stream(self, prompt, model, state=None):
         try:
-            # No ChatSession or upstream conversation metadata is reused between requests.
-            async with aclosing(
-                self.client.generate_content_stream(
-                    prompt,
-                    model=model,
-                    temporary=True,
-                )
-            ) as outputs:
+            metadata = (state or {}).get("metadata")
+            chat = self.client.start_chat(model=model, metadata=metadata)
+            async with aclosing(chat.send_message_stream(prompt, temporary=False)) as outputs:
                 async for output in outputs:
                     if output.text_delta:
                         yield output.text_delta
+            if state is not None:
+                if not chat.cid or not chat.rid or not chat.rcid:
+                    raise ProxyError(
+                        "conversation_metadata_missing", "Gemini returned no chat cursor."
+                    )
+                if metadata and chat.cid != metadata[0]:
+                    raise ProxyError(
+                        "conversation_changed", "Gemini did not continue the saved chat."
+                    )
+                state["metadata"] = list(chat.metadata)
         except asyncio.CancelledError:
             await self.abort()
             raise

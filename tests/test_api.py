@@ -295,7 +295,7 @@ async def test_queue_wait_timeout_preserves_active_request(make_client, settings
 
 async def test_cancel_during_browser_preparation_cleans_candidate(make_client):
     class SlowPrepare(FakeBackend):
-        async def prepare(self, model):
+        async def prepare(self, model, state=None):
             self.prepared.append(model)
             await asyncio.sleep(10)
 

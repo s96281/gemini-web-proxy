@@ -1,6 +1,6 @@
 # Gemini Web → OpenAI API
 
-供個人自架使用的 Gemini Web App 轉接服務，提供 OpenAI Chat Completions API。優先使用自己的 Gemini Cookie；只有在**生成送出前**確認主後端不可用時，才改用已登入的 Chromium 操作網頁。
+供個人自架使用的 Gemini Web App 轉接服務，提供 OpenAI Chat Completions API。使用一般（非臨時）對話，支援接續同一個 Gemini 對話串。優先使用自己的 Gemini Cookie；新對話只有在**生成送出前**確認主後端不可用時，才改用已登入的 Chromium 操作網頁。
 
 支援文字聊天、多輪完整歷史、SSE 串流、單輪單一 function tool call。工具在客戶端執行。使用 Python 3.12+、FastAPI、`gemini-webapi==2.1.1`、Playwright；網頁協定與 DOM 變更可能需要更新適配器。
 
@@ -74,12 +74,43 @@ GP_BROWSER_MODEL_MAP={"your-cookie-model-id":"Exact UI label"}
 
 | 情況 | 行為 |
 | --- | --- |
-| 生成前缺少 Cookie、登入失效、初始化／協定失敗 | 若啟用備援，準備瀏覽器並核對模型 |
+| 新對話生成前缺少 Cookie、登入失效、初始化／協定失敗 | 若啟用備援，準備瀏覽器並核對模型 |
+| 已有對話的後端不可用 | 回報錯誤，不跨後端建立另一串 |
 | 生成已送出、結果不明、部分文字已回傳 | 不切換、不自動重送 |
 | 額度限制、封鎖／驗證挑戰、模型不存在 | 回報錯誤，不自動重送 |
-| 工具回覆格式或參數不合法 | 同一後端以新對話修復一次；仍無效則失敗 |
+| 工具回覆格式或參數不合法 | 在同一個 Gemini 對話內修復一次；仍無效則失敗 |
 
 SDK 內部的生成重試已停用，並有針對固定版本裝飾器的測試。客戶端也應關閉自動重試，例如 OpenAI SDK 的 `max_retries=0`。取消請求會釋放資源，但不能保證已送往 Google 的生成在伺服器端停止或不計額度。
+
+## 接續對話與網頁歷史
+
+Cookie 後端使用 `temporary=False`，保存 Gemini 的 chat/reply/candidate metadata；瀏覽器後端保存對話網址。對話應可在同一個 Google 帳號的 Gemini 網頁歷史中查看，實際保留與顯示仍受帳號及 Gemini 活動設定影響，尚待真實帳號驗收。網頁裡會看到代理送出的角色 JSON 與提示指示，不是原生 API 的分角色訊息。
+
+每次請求仍須傳完整 `messages`，包含代理上一輪回傳的 assistant 訊息（或 tool_calls）以及新增的 user／tool 訊息。若歷史前綴與已完成的對話完全吻合，服務會自動找到該串，只把新增訊息送入 Gemini；新工具定義及輸出要求仍會隨每輪送出。
+
+建議客戶端明確指定 `conversation_id`（本服務擴充欄位），同一串沿用相同 ID。OpenAI Python SDK 可用 `extra_body` 傳入：
+
+```python
+history = [{"role": "user", "content": "請記住，我的代號是小熊。"}]
+first = client.chat.completions.create(
+    model=model,
+    messages=history,
+    extra_body={"conversation_id": "my-thread-001"},
+)
+history.append(first.choices[0].message.model_dump(exclude_none=True))
+history.append({"role": "user", "content": "我的代號是什麼？"})
+second = client.chat.completions.create(
+    model=model,
+    messages=history,
+    extra_body={"conversation_id": "my-thread-001"},
+)
+```
+
+未指定 ID 的新對話會獲配隨機 ID；成功回應的 `X-Conversation-ID` header 可供後續請求使用，串流回應也有此 header。兩個新請求即使問題相同，也會建立不同對話；若連同回答都相同，後續自動辨識會回報 `conversation_ambiguous`（409），需明確指定 ID。
+
+指定既有 ID 時，切換模型、修改／刪除舊歷史、只傳新問題或重送同一輪，會回報 `conversation_conflict`（409）。請使用新 ID 建立分支。生成失敗、取消或程序在生成期間中止時，該串會標記為結果不明，之後回報 `conversation_uncertain`（409）；請先在網頁確認，再以新 ID 建立對話，不會自動重送。已有串固定使用最初的後端，不會因 Cookie 恢復或失效而跨後端續接。也不要同時在網頁手動編輯 API 使用中的對話。
+
+對應資料預設存於 `state/conversations.json`，只包含對話 ID、Gemini metadata／網址、訊息雜湊與狀態，不保存提示或回答明文；需與 Cookie 一起妥善保存並掛載整個 `state`，服務重啟後才能接續。預設保留最近更新的 256 串，可用 `GP_MAX_CONVERSATIONS` 調整；刪除對應檔或較舊項目被淘汰後，下次請求會用完整歷史建立新的 Gemini 串，即使沿用原 ID。只支援單一 process／worker。
 
 ## OpenAI SDK 與 Agent
 
@@ -115,10 +146,10 @@ Cline 的實際 GUI 串接與登入帳號測試尚待使用者環境驗收，不
 
 ## 支援介面與限制
 
-- `POST /v1/chat/completions`：`model`、`messages`、`stream`、`tools`、`tool_choice`、`parallel_tool_calls=false`、`n=1`。`stream_options` 接受空物件或布林值 `include_usage`（含 `true`）；因上游沒有可靠用量，回應仍省略 usage，不產生虛構 token 統計。
+- `POST /v1/chat/completions`：`model`、`messages`、`stream`、`tools`、`tool_choice`、`parallel_tool_calls=false`、`n=1`，以及選填擴充欄位 `conversation_id`。`stream_options` 接受空物件或布林值 `include_usage`（含 `true`）；因上游沒有可靠用量，回應仍省略 usage，不產生虛構 token 統計。
 - 訊息支援 system、developer、user、assistant、tool；content 可為字串或純文字 parts。工具結果的 `tool_call_id` 必須對應尚未回覆的 assistant tool call。
 - 工具支援 function schema 與 auto／none／required／指定函式。參數需為 JSON object，拒絕外部 schema reference；不支援 `strict=true`。schema 驗證不是原生 constrained decoding 的保證。
-- 每次生成以新對話送出完整歷史，不保存或共用 API 對話狀態。Cookie 後端使用 temporary chat；瀏覽器後端建立新對話，可能出現在 Gemini 網頁歷史中。
+- 新對話送出完整歷史；已辨識的後續請求使用原本的 Gemini 對話，只送新增訊息。Cookie 使用非臨時對話，兩個後端皆保存接續所需的對應資料。
 - system/developer 指示、歷史與工具定義序列化至網頁提示，不具備原生 system channel 同等的優先權保證。工具轉換依賴模型遵循格式，可能失敗；代理不會執行模型生成的工具或命令。
 - 一般文字使用增量串流；工具模式緩衝至完整內容通過驗證後，才回傳文字或 tool_calls 串流事件。每輪最多一個工具呼叫，工具 arguments 是 JSON 字串。
 - 不提供不可靠的 token usage。沒有 Responses API、Codex CLI、多模態、多人帳號池或管理 UI。temperature、top_p、max_tokens、stop、response_format 等未支援欄位會回傳 400，避免默默忽略。
@@ -133,6 +164,7 @@ Cline 的實際 GUI 串接與登入帳號測試尚待使用者環境驗收，不
 | `GP_API_KEY` | 必填，至少 16 字元 |
 | `GP_COOKIE_FILE` | `state/cookies.json` |
 | `GP_COOKIE_CACHE` | `state/cookie-cache`，含自動更新的登入憑證 |
+| `GP_CONVERSATION_FILE` / `GP_MAX_CONVERSATIONS` | `state/conversations.json` / `256`，可跨重啟的對話對應與保留上限 |
 | `GP_BROWSER_PROFILE` | `state/browser`，持久化瀏覽器登入 |
 | `GP_BROWSER_ENABLED` / `GP_BROWSER_HEADLESS` | `true` / `true` |
 | `GP_BROWSER_MODEL_MAP` | `{}`，Cookie ID 到精確 UI 模型標籤的 JSON 對照 |
@@ -148,7 +180,7 @@ Cline 的實際 GUI 串接與登入帳號測試尚待使用者環境驗收，不
 
 瀏覽器 UI 改版時，可使用 `GP_BROWSER_SELECTORS_FILE` 覆寫 `gemini_proxy/backends/browser.py` 中 `Selectors` 的欄位，例如 `{"editor":"textarea","model_trigger":"button.my-model-menu"}`。`response_text` 與 `completed` 是相對於每個 `response` 的 selector；`completed` 必須是只在回覆完成後顯示的標記，不能用單純文字靜止時間判定完成。登入、驗證挑戰與額度訊息的 selector 也需與當前 UI 核對。
 
-日誌只記錄請求 ID、後端、耗時、切換原因與錯誤代碼；停用可能暴露上游資料的 SDK 日誌，不記錄 prompt、Cookie 或金鑰。成功回應含 `X-Request-ID`，方便查找紀錄。
+日誌只記錄請求 ID、後端、耗時、切換原因與錯誤代碼；停用可能暴露上游資料的 SDK 日誌，不記錄 prompt、Cookie 或金鑰。成功回應含 `X-Request-ID` 與 `X-Conversation-ID`，方便查找紀錄與接續對話。
 
 ## 開發與驗證
 
@@ -162,7 +194,7 @@ ruff format --check gemini_proxy tests examples
 
 測試使用模擬 Cookie client、OpenAI Python SDK，以及本機 HTML fixture 上的真實 Chromium，涵蓋文字／串流、工具呼叫往返與一次修復、schema 驗證、對話隔離、錯誤格式、備援限制、登入／模型選取、佇列、逾時與取消。不會連入真實 Google 帳號。
 
-目前已驗證固定 SDK 的介面與無生成重試行為；**尚未驗證真實 Gemini 帳號、目前線上 DOM 或 Cline GUI**。部署後請依序實測 `/v1/models`、文字與串流、`examples/agent.py`，再停止服務並暫時移走 Cookie 檔後重啟，以驗證自己的瀏覽器登入及精確模型對應。完成後恢復 Cookie。不要以注入串流中斷的方式測試自動重送，服務刻意不支援該行為。
+目前已驗證固定 SDK 的介面與無生成重試行為；**尚未驗證真實 Gemini 帳號、目前線上 DOM 或 Cline GUI**。部署後請依序實測 `/v1/models`、文字與串流、`examples/agent.py`，並用相同 `conversation_id` 及完整歷史連續問兩輪，確認 Gemini 網頁只有同一串；重啟服務後再問第三輪，確認仍接續。再停止服務並暫時移走 Cookie 檔後重啟，以**新的**對話 ID 驗證自己的瀏覽器登入及精確模型對應，並重複續接驗收。完成後恢復 Cookie。不要以注入串流中斷的方式測試自動重送，服務刻意不支援該行為。
 
 更新依賴時用 `uv pip compile pyproject.toml -o requirements.lock` 重新鎖定，並重新跑全部測試，特別檢查 SDK 的私有 `_generate` 重試裝飾器與瀏覽器完成判定。
 

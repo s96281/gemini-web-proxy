@@ -9,6 +9,9 @@
 <textarea aria-label="Prompt"></textarea><button class="send-button" onclick="generate()">Send</button>
 <script>
 const params = new URLSearchParams(location.search);
+if (params.has('chat')) {
+  document.body.insertAdjacentHTML('beforeend', localStorage.getItem('chat-' + params.get('chat')) || '');
+}
 if (params.has('login')) {
   document.querySelector('textarea').remove();
   const a=document.createElement('a'); a.href='https://accounts.google.com';
@@ -23,6 +26,10 @@ function choose(name) {
 }
 document.addEventListener('keydown', e => {if(e.key==='Escape') menu.hidden=true;});
 function generate() {
+  if (!params.has('chat')) {
+    params.set('chat', crypto.randomUUID());
+    history.replaceState(null, '', '?' + params);
+  }
   if (params.has('quota')) {
     const q = document.createElement('div'); q.dataset.testId='usage-limit-reached';
     document.body.append(q); return;
@@ -39,6 +46,8 @@ function generate() {
   setTimeout(()=>{
     stop.remove(); const copy=document.createElement('button'); copy.setAttribute('aria-label','Copy');
     response.append(copy);
+    localStorage.setItem('chat-' + params.get('chat'),
+      Array.from(document.querySelectorAll('model-response')).map(el => el.outerHTML).join(''));
   }, 600);
 }
 </script></body></html>

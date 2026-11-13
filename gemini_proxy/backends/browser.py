@@ -82,9 +82,10 @@ class BrowserBackend:
                 "upstream_rate_limit", "Gemini quota exceeded; no automatic resend.", 429
             )
 
-    async def _fresh_page(self):
+    async def _fresh_page(self, state=None):
         await self._open()
-        await self.page.goto(self.url, wait_until="domcontentloaded")
+        target = (state or {}).get("url", self.url)
+        await self.page.goto(target, wait_until="domcontentloaded")
         await self._check_errors()
         if "accounts.google.com" in self.page.url:
             raise ProxyError("browser_login_required", "Browser requires manual Google login.", 503)
@@ -99,7 +100,20 @@ class BrowserBackend:
                 "Browser login required: stop service and run gemini-proxy login.",
                 503,
             ) from None
-        if await self.page.locator(self.selectors.response).count():
+        if state and state.get("url"):
+            if self.page.url != target:
+                raise ProxyError(
+                    "conversation_unavailable", "Gemini redirected the saved chat.", 409
+                )
+            try:
+                await self.page.locator(self.selectors.response).first.wait_for(state="visible")
+            except Exception:
+                raise ProxyError(
+                    "conversation_unavailable",
+                    "Saved Gemini conversation could not be loaded.",
+                    409,
+                ) from None
+        elif await self.page.locator(self.selectors.response).count():
             link = self.page.locator(self.selectors.new_chat).first
             if not await link.count():
                 raise ProxyError(
@@ -162,10 +176,10 @@ class BrowserBackend:
                 "browser_unavailable", "Browser model discovery failed; check login/UI.", 503
             ) from None
 
-    async def prepare(self, model):
+    async def prepare(self, model, state=None):
         try:
             async with asyncio.timeout(self.settings.preflight_timeout):
-                await self._fresh_page()
+                await self._fresh_page(state)
                 options = await self._options()
                 label = self.settings.browser_model_map.get(model)
                 matches = [
@@ -202,20 +216,21 @@ class BrowserBackend:
                 "browser_unavailable", "Browser preparation failed; check login/UI.", 503
             ) from None
 
-    async def stream(self, prompt, model):
+    async def stream(self, prompt, model, state=None):
         if self.selected_model != model:
             raise ProxyError("browser_model_unconfirmed", "Browser model was not prepared.")
         s, p = self.selectors, self.page
         previous = ""
         finished = False
         try:
+            response_count = await p.locator(s.response).count()
             await p.locator(s.editor).first.fill(prompt)
             # From this click onward an error must never trigger a fallback/retry.
             await p.locator(s.send).first.click()
             while True:
                 await self._check_errors()
                 responses = p.locator(s.response)
-                if await responses.count():
+                if await responses.count() > response_count:
                     response = responses.last
                     text_el = response.locator(s.response_text).first
                     text = await text_el.inner_text() if await text_el.count() else ""
@@ -231,6 +246,13 @@ class BrowserBackend:
                     stop = p.locator(s.stop).first
                     stopping = await stop.count() and await stop.is_visible()
                     if previous and await done.count() and await done.is_visible() and not stopping:
+                        if state is not None:
+                            if p.url == self.url:
+                                raise ProxyError(
+                                    "conversation_metadata_missing",
+                                    "Gemini did not provide a saved conversation URL.",
+                                )
+                            state["url"] = p.url
                         finished = True
                         break
                 await asyncio.sleep(0.15)

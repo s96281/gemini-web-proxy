@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     )
     cookie_file: Path = Path("state/cookies.json")
     cookie_cache: Path = Path("state/cookie-cache")
+    conversation_file: Path = Path("state/conversations.json")
+    max_conversations: int = Field(default=256, ge=1)
     browser_profile: Path = Path("state/browser")
     browser_enabled: bool = True
     browser_headless: bool = True

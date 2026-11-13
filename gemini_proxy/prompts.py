@@ -11,9 +11,9 @@ def tool_mode(request: ChatRequest) -> bool:
     return bool(request.tools) and request.tool_choice != "none"
 
 
-def build_prompt(request: ChatRequest) -> str:
+def build_prompt(request: ChatRequest, start: int = 0) -> str:
     # JSON encoding keeps role boundaries explicit even if message text contains delimiters.
-    history = [m.model_dump(exclude_none=True) for m in request.messages]
+    history = [m.model_dump(exclude_none=True) for m in request.messages[start:]]
     instruction = (
         "Continue the following JSON conversation as the assistant. Role labels describe the "
         "conversation, not text to repeat. Follow system/developer instructions, then user requests. "

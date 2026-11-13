@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from gemini_webapi import GeminiClient
+from gemini_webapi.client import ChatSession
 from gemini_webapi.constants import AccountStatus
 from gemini_webapi.exceptions import APIError, AuthError, UsageLimitExceededError
 from gemini_webapi.utils.decorators import running
@@ -18,6 +19,7 @@ class Client:
         self.account_status = AccountStatus.AVAILABLE
         self.requests = []
         self.closed = False
+        self.sessions = []
 
     async def init(self, **kwargs):
         assert kwargs["auto_refresh"] is True
@@ -31,10 +33,22 @@ class Client:
         ]
 
     async def generate_content_stream(self, prompt, **kwargs):
-        assert kwargs == {"model": "account-model", "temporary": True}
+        assert kwargs["model"] == "account-model"
+        assert kwargs["temporary"] is False
+        chat = kwargs["chat"]
         self.requests.append(prompt)
         yield SimpleNamespace(text_delta="first")
         yield SimpleNamespace(text_delta=" second")
+        chat.metadata = [
+            chat.cid or f"chat-{len(self.requests)}",
+            f"reply-{len(self.requests)}",
+            "rc",
+        ]
+
+    def start_chat(self, **kwargs):
+        chat = ChatSession(self, **kwargs)
+        self.sessions.append(list(chat.metadata))
+        return chat
 
     async def close(self):
         self.closed = True
@@ -53,6 +67,23 @@ async def test_cookie_adapter_dynamic_models_and_isolated_calls(settings, monkey
     with pytest.raises(ProxyError) as exc:
         await backend.prepare("unavailable")
     assert exc.value.status == 404 and not exc.value.safe_fallback
+    await backend.close()
+
+
+async def test_cookie_saved_cursor_continues_after_client_restart(settings):
+    settings.cookie_file.write_text('{"__Secure-1PSID":"private-cookie"}')
+    state = {}
+    backend = CookieBackend(settings, Client)
+    await backend.prepare("account-model")
+    assert "".join([s async for s in backend.stream("one", "account-model", state)])
+    saved = json.loads(json.dumps(state))
+    assert saved["metadata"][:3] == ["chat-1", "reply-1", "rc"]
+    await backend.close()
+    backend = CookieBackend(settings, Client)
+    await backend.prepare("account-model", saved)
+    assert "".join([s async for s in backend.stream("next", "account-model", saved)])
+    assert backend.client.sessions[0][:3] == ["chat-1", "reply-1", "rc"]
+    assert saved["metadata"][0] == "chat-1"
     await backend.close()
 
 
