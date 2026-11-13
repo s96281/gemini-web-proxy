@@ -25,6 +25,7 @@ class FakeBackend:
         self.active = 0
         self.max_active = 0
         self.states = []
+        self.images = []
 
     async def models(self):
         if self.prepare_error:
@@ -36,8 +37,12 @@ class FakeBackend:
         if self.prepare_error:
             raise self.prepare_error
 
-    async def stream(self, prompt, model, state=None):
+    async def history_status(self, state):
+        return {"listed_in_recent_history": None, "latest_turn_readable": None}
+
+    async def stream(self, prompt, model, state=None, images=None):
         self.prompts.append(prompt)
+        self.images.append(images or [])
         self.states.append(dict(state) if state is not None else None)
         response = self.responses.popleft()
         self.active += 1

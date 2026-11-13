@@ -30,6 +30,17 @@ class Selectors:
     challenge: str = 'iframe[src*="recaptcha"], form[action*="/sorry/"]'
     quota: str = '[data-test-id="usage-limit-reached"]'
     login: str = 'a[href*="accounts.google.com"], button[data-test-id="sign-in-button"]'
+    upload_input: str = 'input[type="file"]'
+    upload_trigger: str = (
+        'button[aria-label*="Add files" i], button[aria-label*="Upload" i], '
+        'button[aria-label*="新增檔案"], button[aria-label*="上傳"]'
+    )
+    upload_local: str = (
+        '[data-test-id="local-upload-button"], [role="menuitem"]:has-text("Upload files"), '
+        '[role="menuitem"]:has-text("上傳檔案")'
+    )
+    attachment: str = 'uploader-file-preview, [data-test-id="file-preview"]'
+    upload_progress: str = '[role="progressbar"], mat-progress-spinner, [aria-busy="true"]'
 
 
 class BrowserBackend:
@@ -216,7 +227,53 @@ class BrowserBackend:
                 "browser_unavailable", "Browser preparation failed; check login/UI.", 503
             ) from None
 
-    async def stream(self, prompt, model, state=None):
+    async def attach_images(self, images):
+        if not images:
+            return
+        p, s = self.page, self.selectors
+        payload = [
+            {"name": image.name, "mimeType": image.mime_type, "buffer": image.data}
+            for image in images
+        ]
+        try:
+            inputs = p.locator(s.upload_input)
+            if not await inputs.count():
+                await p.locator(s.upload_trigger).first.click()
+            if await inputs.count():
+                await inputs.last.set_input_files(payload)
+            else:
+                async with p.expect_file_chooser() as chooser:
+                    await p.locator(s.upload_local).first.click()
+                await (await chooser.value).set_files(payload)
+            # Do not submit until every filename appears in a ready attachment preview.
+            await p.wait_for_function(
+                """({attachment, progress, names}) => {
+                    const cards = Array.from(document.querySelectorAll(attachment));
+                    const visible = el => !!el.getClientRects().length;
+                    const uploading = Array.from(document.querySelectorAll(progress)).some(visible);
+                    return !uploading && names.every(name => cards.some(card => {
+                        const labels = [card.textContent, card.getAttribute('title'),
+                            card.getAttribute('aria-label')];
+                        for (const node of card.querySelectorAll('[alt], [title], [aria-label]')) {
+                            labels.push(node.getAttribute('alt'), node.getAttribute('title'),
+                                node.getAttribute('aria-label'));
+                        }
+                        return visible(card) && labels.some(label => label && label.includes(name));
+                    }));
+                }""",
+                arg={
+                    "attachment": s.attachment,
+                    "progress": s.upload_progress,
+                    "names": [image.name for image in images],
+                },
+                timeout=self.settings.preflight_timeout * 1000,
+            )
+        except Exception:
+            raise ProxyError(
+                "browser_upload_failed", "Could not confirm image uploads; no message was sent."
+            ) from None
+
+    async def stream(self, prompt, model, state=None, images=None):
         if self.selected_model != model:
             raise ProxyError("browser_model_unconfirmed", "Browser model was not prepared.")
         s, p = self.selectors, self.page
@@ -225,6 +282,7 @@ class BrowserBackend:
         try:
             response_count = await p.locator(s.response).count()
             await p.locator(s.editor).first.fill(prompt)
+            await self.attach_images(images)
             # From this click onward an error must never trigger a fallback/retry.
             await p.locator(s.send).first.click()
             while True:

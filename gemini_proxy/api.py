@@ -200,7 +200,14 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
 
     @app.get("/health/live")
     async def live():
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "capabilities": [
+                "persistent_conversations",
+                "base64_image_uploads",
+                "history_diagnostics",
+            ],
+        }
 
     @app.get("/health/ready", dependencies=[Depends(authenticate)])
     async def ready():
@@ -221,6 +228,26 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
                 for m in catalog
             ],
         }
+
+    @app.get("/v1/conversations", dependencies=[Depends(authenticate)])
+    async def conversations():
+        async with service.slot():
+            return {
+                "object": "list",
+                "data": [
+                    {
+                        "id": key,
+                        "backend": entry["backend"],
+                        "local_state": "completed" if entry["valid"] else "uncertain",
+                    }
+                    for key, entry in reversed(service.conversations.entries.items())
+                ],
+            }
+
+    @app.get("/v1/conversations/{conversation_id:path}", dependencies=[Depends(authenticate)])
+    async def conversation(conversation_id: str, request: Request):
+        async with service.slot():
+            return await connected(request, service.conversation_info(conversation_id))
 
     @app.post("/v1/chat/completions", dependencies=[Depends(authenticate)])
     async def chat(body: ChatRequest, request: Request):

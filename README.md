@@ -2,7 +2,7 @@
 
 供個人自架使用的 Gemini Web App 轉接服務，提供 OpenAI Chat Completions API。使用一般（非臨時）對話，支援接續同一個 Gemini 對話串。優先使用自己的 Gemini Cookie；新對話只有在**生成送出前**確認主後端不可用時，才改用已登入的 Chromium 操作網頁。
 
-支援文字聊天、多輪完整歷史、SSE 串流、單輪單一 function tool call。工具在客戶端執行。使用 Python 3.12+、FastAPI、`gemini-webapi==2.1.1`、Playwright；網頁協定與 DOM 變更可能需要更新適配器。
+支援文字與圖片輸入、多輪完整歷史、SSE 串流、單輪單一 function tool call。工具在客戶端執行。使用 Python 3.12+、FastAPI、`gemini-webapi==2.1.1`、Playwright；網頁協定與 DOM 變更可能需要更新適配器。
 
 ## 本機啟動
 
@@ -84,7 +84,7 @@ SDK 內部的生成重試已停用，並有針對固定版本裝飾器的測試�
 
 ## 接續對話與網頁歷史
 
-Cookie 後端使用 `temporary=False`，保存 Gemini 的 chat/reply/candidate metadata；瀏覽器後端保存對話網址。對話應可在同一個 Google 帳號的 Gemini 網頁歷史中查看，實際保留與顯示仍受帳號及 Gemini 活動設定影響，尚待真實帳號驗收。網頁裡會看到代理送出的角色 JSON 與提示指示，不是原生 API 的分角色訊息。
+Cookie 後端使用 `temporary=False`，保存 Gemini 的 chat/reply/candidate metadata；瀏覽器後端保存對話網址。拿到對話 metadata 僅代表可嘗試續接，**不能保證該串已列在 Gemini 網頁歷史中**；實際顯示與保存須在同一個 Google 帳號下驗證。網頁裡會看到代理送出的角色 JSON 與提示指示，不是原生 API 的分角色訊息。
 
 每次請求仍須傳完整 `messages`，包含代理上一輪回傳的 assistant 訊息（或 tool_calls）以及新增的 user／tool 訊息。若歷史前綴與已完成的對話完全吻合，服務會自動找到該串，只把新增訊息送入 Gemini；新工具定義及輸出要求仍會隨每輪送出。
 
@@ -111,6 +111,57 @@ second = client.chat.completions.create(
 指定既有 ID 時，切換模型、修改／刪除舊歷史、只傳新問題或重送同一輪，會回報 `conversation_conflict`（409）。請使用新 ID 建立分支。生成失敗、取消或程序在生成期間中止時，該串會標記為結果不明，之後回報 `conversation_uncertain`（409）；請先在網頁確認，再以新 ID 建立對話，不會自動重送。已有串固定使用最初的後端，不會因 Cookie 恢復或失效而跨後端續接。也不要同時在網頁手動編輯 API 使用中的對話。
 
 對應資料預設存於 `state/conversations.json`，只包含對話 ID、Gemini metadata／網址、訊息雜湊與狀態，不保存提示或回答明文；需與 Cookie 一起妥善保存並掛載整個 `state`，服務重啟後才能接續。預設保留最近更新的 256 串，可用 `GP_MAX_CONVERSATIONS` 調整；刪除對應檔或較舊項目被淘汰後，下次請求會用完整歷史建立新的 Gemini 串，即使沿用原 ID。只支援單一 process／worker。
+
+### 網頁找不到純文字對話時
+
+此問題與是否附圖無關。先確認 `GET /health/live` 的 `capabilities` 含 `persistent_conversations` 與 `history_diagnostics`；沒有表示目前執行的程式尚未更新到此版本，或連到另一個服務。更新程式後須重啟原本的 `gemini-proxy serve` process。
+
+以 Bearer Key 呼叫 `GET /v1/conversations`，可列出本機對話 ID（最近更新的在前）。再呼叫 `GET /v1/conversations/<ID>`，取得：
+
+- `gemini_chat_url`：Gemini 原對話網址，請以 Cookie 所屬的 Google 帳號開啟；如果瀏覽器同時登入多個帳號，務必確認帳號。
+- `backend`：實際使用 `cookie` 或 `browser`；瀏覽器 profile 與匯入的 Cookie 可能屬於不同帳號。
+- `local_state`：代理本機這一輪是否完成，**不代表** Google 已保存歷史。
+- `listed_in_recent_history`：Cookie 後端重新向 Google 查詢近期 50 串及釘選清單後，是否找到此 ID。`true` 表示已列出，`false` 表示本次清單沒有，`null` 表示未知／查詢不可用；沒有列出也可能只是已不在近期範圍。
+- `latest_turn_readable`：只有重新讀取到相符的 chat/reply ID 才為 `true`；`null` 表示未能確認最新回合。SDK 可能將上游讀取失敗回傳為空值，因此不能把空值解讀為確定未保存。
+- `history_check_error`：若查詢失敗則提供安全的錯誤碼，不回傳上游內容或登入憑證。瀏覽器後端這兩個歷史檢查欄位目前為 `null`，請直接開啟網址檢查。
+
+這些檢查只讀取狀態，不會重新生成或改動 Google 活動設定。`list_chats()` 的 SDK 本機快取不作為保存證據。若查詢與網頁不一致，請保留上述診斷結果及目前版本，以確認帳號、線上協定或網頁問題，勿貼出 Cookie、API Key 或整個 `state` 檔案。
+
+PowerShell 範例（API Key 已設定在目前視窗的環境變數時）：
+
+```powershell
+$headers = @{ Authorization = "Bearer $env:GP_API_KEY" }
+$threads = (Invoke-RestMethod http://127.0.0.1:8000/v1/conversations -Headers $headers).data
+if ($threads.Count -gt 0) {
+    $id = [uri]::EscapeDataString($threads[0].id)
+    Invoke-RestMethod "http://127.0.0.1:8000/v1/conversations/$id" -Headers $headers |
+        ConvertTo-Json
+}
+```
+
+## 圖片輸入
+
+支援 user 訊息內的 `image_url` part，URL 格式為 `data:image/jpeg;base64,...`、PNG、WebP 或 GIF。**不會下載 HTTP(S) URL 或讀取本機路徑**；這些格式回傳 `unsupported_image_url`（400）。`detail` 接受 `auto`、`low`、`high` 以相容客戶端，但上游網頁沒有等價控制，本服務不保證其解析度效果。
+
+圖片會解碼並驗證 base64、MIME 檔頭與大小，再實際上傳。Cookie 後端使用具正確副檔名的暫存檔傳入 SDK `files`（正常完成、失敗與取消時清理）；瀏覽器後端使用 file input／檔案選擇器附圖，確認所有檔名的預覽已出現且上傳進度消失後才送出訊息。圖片格式完整性及模型可用性仍由 Gemini 判定；瀏覽器 UI 的 selector 需與線上介面核對。
+
+文字提示只保留附件檔名與訊息順序，不包含 base64。已辨識的同一對話只上傳新增訊息裡的圖片，舊圖留在 Gemini 上游對話；工具格式修復不重複附圖。對話對應檔也不保存圖片或 base64。Google／瀏覽器 profile 的附件保存遵循上游行為。
+
+```python
+import base64
+from pathlib import Path
+
+image = base64.b64encode(Path("photo.jpg").read_bytes()).decode("ascii")
+response = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": [
+        {"type": "text", "text": "這張圖片是什麼？"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image}},
+    ]}],
+)
+```
+
+預設每次最多新增 8 張、單張 10,000,000 bytes、合計 20,000,000 bytes，整個 JSON body 上限為 32,000,000 bytes（含完整歷史及 base64 約 4/3 的編碼開銷）。**既有 `.env` 若仍有 `GP_MAX_REQUEST_BYTES=2000000`，需調高並重啟服務**，否則大圖會在解析前回傳 413。圖片可搭配一般文字、SSE 與 function tools 使用。
 
 ## OpenAI SDK 與 Agent
 
@@ -147,12 +198,12 @@ Cline 的實際 GUI 串接與登入帳號測試尚待使用者環境驗收，不
 ## 支援介面與限制
 
 - `POST /v1/chat/completions`：`model`、`messages`、`stream`、`tools`、`tool_choice`、`parallel_tool_calls=false`、`n=1`，以及選填擴充欄位 `conversation_id`。`stream_options` 接受空物件或布林值 `include_usage`（含 `true`）；因上游沒有可靠用量，回應仍省略 usage，不產生虛構 token 統計。
-- 訊息支援 system、developer、user、assistant、tool；content 可為字串或純文字 parts。工具結果的 `tool_call_id` 必須對應尚未回覆的 assistant tool call。
+- 訊息支援 system、developer、user、assistant、tool；content 可為字串或純文字 parts，user 訊息另支援 base64 `image_url` parts。工具結果的 `tool_call_id` 必須對應尚未回覆的 assistant tool call。
 - 工具支援 function schema 與 auto／none／required／指定函式。參數需為 JSON object，拒絕外部 schema reference；不支援 `strict=true`。schema 驗證不是原生 constrained decoding 的保證。
 - 新對話送出完整歷史；已辨識的後續請求使用原本的 Gemini 對話，只送新增訊息。Cookie 使用非臨時對話，兩個後端皆保存接續所需的對應資料。
 - system/developer 指示、歷史與工具定義序列化至網頁提示，不具備原生 system channel 同等的優先權保證。工具轉換依賴模型遵循格式，可能失敗；代理不會執行模型生成的工具或命令。
 - 一般文字使用增量串流；工具模式緩衝至完整內容通過驗證後，才回傳文字或 tool_calls 串流事件。每輪最多一個工具呼叫，工具 arguments 是 JSON 字串。
-- 不提供不可靠的 token usage。沒有 Responses API、Codex CLI、多模態、多人帳號池或管理 UI。temperature、top_p、max_tokens、stop、response_format 等未支援欄位會回傳 400，避免默默忽略。
+- 不提供不可靠的 token usage。沒有 Responses API、Codex CLI、音訊／影片輸入、多人帳號池或管理 UI。temperature、top_p、max_tokens、stop、response_format 等未支援欄位會回傳 400，避免默默忽略。
 - 一般錯誤使用 `{"error":{"message":...,"type":...,"param":null,"code":...}}`。第一筆內容前的錯誤以對應 HTTP 狀態回應；串流途中失敗發出 `data: {"error":...}` 後關閉，不發送成功 finish 或 `[DONE]`。成功串流以 `[DONE]` 結束。
 
 ## 設定與維護
@@ -174,11 +225,14 @@ Cline 的實際 GUI 串接與登入帳號測試尚待使用者環境驗收，不
 | `GP_REQUEST_TIMEOUT` | 300 秒，取得執行位置後含準備、生成及格式修復 |
 | `GP_PREFLIGHT_TIMEOUT` | 30 秒，上游初始化或瀏覽器準備 |
 | `GP_QUEUE_TIMEOUT` / `GP_MAX_QUEUE` | 30 秒 / 8 個等待者；單帳號一次一個請求 |
-| `GP_MAX_REQUEST_BYTES` / `GP_MAX_OUTPUT_CHARS` | 2,000,000 bytes / 1,000,000 字元 |
+| `GP_MAX_REQUEST_BYTES` / `GP_MAX_OUTPUT_CHARS` | 32,000,000 bytes / 1,000,000 字元 |
+| `GP_MAX_IMAGES` / `GP_MAX_IMAGE_BYTES` / `GP_MAX_TOTAL_IMAGE_BYTES` | 8 張 / 單張 10,000,000 bytes / 本輪新增圖片共 20,000,000 bytes |
 
 `/v1/models` 與 readiness 也使用同一個排程鎖。佇列滿回傳 429，排隊逾時 503，生成逾時 504。使用單一服務 process／worker；不要讓多個 process 同時開啟同一瀏覽器 profile。
 
 瀏覽器 UI 改版時，可使用 `GP_BROWSER_SELECTORS_FILE` 覆寫 `gemini_proxy/backends/browser.py` 中 `Selectors` 的欄位，例如 `{"editor":"textarea","model_trigger":"button.my-model-menu"}`。`response_text` 與 `completed` 是相對於每個 `response` 的 selector；`completed` 必須是只在回覆完成後顯示的標記，不能用單純文字靜止時間判定完成。登入、驗證挑戰與額度訊息的 selector 也需與當前 UI 核對。
+
+圖片上傳相關 selector 為 `upload_input`、`upload_trigger`、`upload_local`、`attachment`、`upload_progress`。`attachment` 預覽需在文字、title、alt 或 aria-label 中包含附件檔名；無法確認時回報 `browser_upload_failed`，不會省略圖片後繼續送出。
 
 日誌只記錄請求 ID、後端、耗時、切換原因與錯誤代碼；停用可能暴露上游資料的 SDK 日誌，不記錄 prompt、Cookie 或金鑰。成功回應含 `X-Request-ID` 與 `X-Conversation-ID`，方便查找紀錄與接續對話。
 

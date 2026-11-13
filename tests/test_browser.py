@@ -10,11 +10,14 @@ import pytest
 from gemini_proxy.api import create_app
 from gemini_proxy.backends.browser import BrowserBackend
 from gemini_proxy.errors import ProxyError
+from gemini_proxy.images import prepare_images
 from gemini_proxy.schema import ChatRequest
 from gemini_proxy.service import Service
 
 from .conftest import AUTH, FakeBackend
 from .test_api import BASIC
+from .test_conversations import followup
+from .test_images import IMAGE_REQUEST, PNG
 
 
 @pytest.fixture(scope="module")
@@ -123,6 +126,44 @@ async def test_real_browser_fallback_through_openai_endpoint(browser, settings):
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == "Hello browser"
         assert not primary.prompts
+
+
+async def test_browser_uploads_actual_images_then_continues_without_reupload(browser, settings):
+    primary = FakeBackend(
+        prepare_error=ProxyError("cookie_missing", "No cookie", 503, safe_fallback=True)
+    )
+    service = Service(settings, primary, browser)
+    app = create_app(settings, service)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test", headers=AUTH
+    ) as client:
+        body = IMAGE_REQUEST | {"model": "web-fast"}
+        first = await client.post("/v1/chat/completions", json=body)
+        assert first.status_code == 200
+        uploaded = await browser.page.evaluate("window.sentImages")
+        assert len(uploaded) == 1 and uploaded[0]["bytes"] == list(PNG)
+        assert uploaded[0]["type"] == "image/png" and uploaded[0]["name"].endswith(".png")
+        assert not await browser.page.evaluate("window.sentWhileUploading")
+        url = browser.page.url
+        second = await client.post(
+            "/v1/chat/completions", json=followup(body, first.json()["choices"][0]["message"])
+        )
+        assert second.status_code == 200 and browser.page.url == url
+        assert await browser.page.evaluate("window.sentImages") == []
+
+
+async def test_browser_never_sends_when_upload_does_not_finish(browser, fixture_url, settings):
+    browser.url = fixture_url + "?upload-hang"
+    await browser.prepare("web-fast")
+    settings.preflight_timeout = 1
+    sent = []
+    await browser.page.expose_function("recordSend", lambda: sent.append(True))
+    images = prepare_images(ChatRequest(**IMAGE_REQUEST), 0, settings)
+    with pytest.raises(ProxyError) as error:
+        async for _ in browser.stream("inspect", "web-fast", {}, images):
+            pass
+    assert error.value.code == "browser_upload_failed"
+    assert browser.context is None and not sent
 
 
 async def test_browser_timeout_closes_profile_and_releases_queue(browser, settings, fixture_url):

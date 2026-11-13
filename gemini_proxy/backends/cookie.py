@@ -10,6 +10,7 @@ from loguru import logger
 
 from ..config import Settings
 from ..errors import ProxyError
+from ..images import image_files
 from .base import Model
 
 # The pinned SDK logs raw upstream exceptions and cookie cache filenames. Disable its logger.
@@ -126,14 +127,40 @@ class CookieBackend:
         if model not in {m.id for m in await self.models()}:
             raise ProxyError("model_not_found", "Model is not available for this account.", 404)
 
-    async def stream(self, prompt, model, state=None):
+    async def history_status(self, state):
+        await self._init()
+        metadata = state.get("metadata")
+        result = {"listed_in_recent_history": None, "latest_turn_readable": None}
+        if not metadata:
+            return result
+        try:
+            async with asyncio.timeout(self.settings.preflight_timeout):
+                # list_chats() alone is a local SDK cache, not evidence of Google persistence.
+                await self.client._fetch_recent_chats(recent=50)
+                chats = self.client.list_chats()
+                if chats is not None:
+                    result["listed_in_recent_history"] = any(c.cid == metadata[0] for c in chats)
+                history = await self.client.read_chat(metadata[0], limit=1)
+                if history and history.cid == metadata[0]:
+                    for turn in history.turns:
+                        output = turn.model_output
+                        if output and output.metadata[:2] == metadata[:2]:
+                            result["latest_turn_readable"] = True
+        except Exception:
+            result["history_check_error"] = "upstream_history_unavailable"
+        return result
+
+    async def stream(self, prompt, model, state=None, images=None):
         try:
             metadata = (state or {}).get("metadata")
             chat = self.client.start_chat(model=model, metadata=metadata)
-            async with aclosing(chat.send_message_stream(prompt, temporary=False)) as outputs:
-                async for output in outputs:
-                    if output.text_delta:
-                        yield output.text_delta
+            with image_files(images) as files:
+                async with aclosing(
+                    chat.send_message_stream(prompt, files=files, temporary=False)
+                ) as outputs:
+                    async for output in outputs:
+                        if output.text_delta:
+                            yield output.text_delta
             if state is not None:
                 if not chat.cid or not chat.rid or not chat.rcid:
                     raise ProxyError(

@@ -28,16 +28,30 @@ class Message(StrictModel):
     name: str | None = None
 
     @model_validator(mode="after")
-    def text_only(self):
+    def validate_content(self):
         if isinstance(self.content, list):
-            if any(
-                set(p) != {"type", "text"}
-                or p.get("type") != "text"
-                or not isinstance(p.get("text"), str)
-                for p in self.content
-            ):
-                raise ValueError("Only text content parts are supported")
-            self.content = "".join(p["text"] for p in self.content)
+            has_image = False
+            for part in self.content:
+                if part.get("type") == "text":
+                    if set(part) != {"type", "text"} or not isinstance(part["text"], str):
+                        raise ValueError("Text parts require a string text field")
+                elif part.get("type") == "image_url":
+                    image = part.get("image_url")
+                    if (
+                        self.role != "user"
+                        or set(part) != {"type", "image_url"}
+                        or not isinstance(image, dict)
+                        or set(image) - {"url", "detail"}
+                        or not isinstance(image.get("url"), str)
+                        or not image["url"]
+                        or image.get("detail", "auto") not in ("auto", "low", "high")
+                    ):
+                        raise ValueError("image_url requires a user message and a valid URL/detail")
+                    has_image = True
+                else:
+                    raise ValueError("Only text and image_url content parts are supported")
+            if not has_image:
+                self.content = "".join(p["text"] for p in self.content)
         if self.tool_calls and self.role != "assistant":
             raise ValueError("tool_calls require assistant role")
         if self.role == "tool" and not self.tool_call_id:

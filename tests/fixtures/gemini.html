@@ -7,6 +7,8 @@
 <button role="menuitemradio" aria-disabled="true"><span class="mode-title">Unavailable</span></button>
 </div>
 <textarea aria-label="Prompt"></textarea><button class="send-button" onclick="generate()">Send</button>
+<input type="file" accept="image/*" multiple onchange="upload(this.files)">
+<div id="attachments"></div>
 <script>
 const params = new URLSearchParams(location.search);
 if (params.has('chat')) {
@@ -25,7 +27,23 @@ function choose(name) {
   menu.hidden=true;
 }
 document.addEventListener('keydown', e => {if(e.key==='Escape') menu.hidden=true;});
+async function upload(files) {
+  attachments.innerHTML='';
+  window.uploadedImages=[];
+  for (const file of files) {
+    const card=document.createElement('uploader-file-preview');
+    card.textContent=file.name;
+    const progress=document.createElement('progress'); progress.setAttribute('role','progressbar');
+    card.append(progress); attachments.append(card);
+    window.uploadedImages.push({name:file.name, type:file.type, bytes:Array.from(new Uint8Array(await file.arrayBuffer()))});
+    if (!params.has('upload-hang')) setTimeout(()=>progress.remove(), 200);
+  }
+}
 function generate() {
+  if (window.recordSend) window.recordSend();
+  window.sentWhileUploading=!!document.querySelector('[role="progressbar"]');
+  window.sentImages=window.uploadedImages || [];
+  attachments.innerHTML='';
   if (!params.has('chat')) {
     params.set('chat', crypto.randomUUID());
     history.replaceState(null, '', '?' + params);

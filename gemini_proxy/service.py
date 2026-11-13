@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import re
 import time
 from contextlib import aclosing, asynccontextmanager
 
 from .conversations import Conversations, fingerprints
 from .errors import ProxyError
+from .images import prepare_images
 from .prompts import build_prompt, parse_tool_output, repair_prompt, tool_mode
 
 log = logging.getLogger("gemini_proxy")
@@ -60,6 +62,34 @@ class Service:
                 raise
             return await self.browser.models()
 
+    async def conversation_info(self, conversation_id):
+        entry = self.conversations.entries.get(conversation_id)
+        if entry is None:
+            raise ProxyError("conversation_not_found", "Conversation mapping was not found.", 404)
+        state = entry["state"]
+        metadata = state.get("metadata", [])
+        url = state.get("url")
+        if entry["backend"] == "cookie" and metadata:
+            match = re.fullmatch(r"c_([A-Za-z0-9_-]+)", metadata[0])
+            if match:
+                url = "https://gemini.google.com/app/" + match[1]
+        info = {
+            "conversation_id": conversation_id,
+            "backend": entry["backend"],
+            "model": entry["model"],
+            "local_state": "completed" if entry["valid"] else "uncertain",
+            "temporary": False,
+            "gemini_chat_url": url,
+            "listed_in_recent_history": None,
+            "latest_turn_readable": None,
+        }
+        if entry["backend"] == "cookie":
+            try:
+                info.update(await self.cookie.history_status(state))
+            except ProxyError as exc:
+                info["history_check_error"] = exc.code
+        return info
+
     async def select(self, model, request_id, entry=None):
         candidate = self.cookie if entry is None or entry["backend"] == "cookie" else self.browser
         if candidate is None:
@@ -79,10 +109,10 @@ class Service:
             await self.abort_backend(candidate)
             raise
 
-    async def collect(self, backend, prompt, model, state):
+    async def collect(self, backend, prompt, model, state, images=None):
         pieces = []
         size = 0
-        async with aclosing(backend.stream(prompt, model, state)) as outputs:
+        async with aclosing(backend.stream(prompt, model, state, images=images)) as outputs:
             async for text in outputs:
                 size += len(text)
                 if size > self.settings.max_output_chars:
@@ -103,8 +133,10 @@ class Service:
                 try:
                     async with asyncio.timeout(self.settings.request_timeout):
                         entry, hashes = self.conversations.resolve(request)
-                        backend = await self.select(request.model, request_id, entry)
                         start = len(entry["hashes"]) if entry else 0
+                        images = prepare_images(request, start, self.settings)
+                        prompt = build_prompt(request, start)
+                        backend = await self.select(request.model, request_id, entry)
                         state = dict(entry["state"]) if entry else {}
                         # Persist uncertainty before dispatch, including process crashes.
                         entry = {
@@ -115,9 +147,8 @@ class Service:
                             "valid": False,
                         }
                         self.conversations.save(request.conversation_id, entry)
-                        prompt = build_prompt(request, start)
                         if tool_mode(request):
-                            raw = await self.collect(backend, prompt, request.model, state)
+                            raw = await self.collect(backend, prompt, request.model, state, images)
                             try:
                                 message = parse_tool_output(raw, request)
                             except ProxyError:
@@ -138,7 +169,7 @@ class Service:
                             size = 0
                             pieces = []
                             async with aclosing(
-                                backend.stream(prompt, request.model, state)
+                                backend.stream(prompt, request.model, state, images=images)
                             ) as outputs:
                                 async for text in outputs:
                                     size += len(text)
