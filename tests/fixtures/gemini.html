@@ -1,0 +1,44 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Local Gemini adapter fixture</title>
+<body>
+<button data-test-id="bard-mode-menu-button" onclick="menu.hidden=false">Fast</button>
+<div id="menu" hidden>
+<button role="menuitemradio" onclick="choose('Fast')"><span class="mode-title">Fast</span></button>
+<button role="menuitemradio" onclick="choose('Pro')"><span class="mode-title">Pro</span></button>
+<button role="menuitemradio" aria-disabled="true"><span class="mode-title">Unavailable</span></button>
+</div>
+<textarea aria-label="Prompt"></textarea><button class="send-button" onclick="generate()">Send</button>
+<script>
+const params = new URLSearchParams(location.search);
+if (params.has('login')) {
+  document.querySelector('textarea').remove();
+  const a=document.createElement('a'); a.href='https://accounts.google.com';
+  a.textContent='Sign in'; document.body.append(a);
+}
+if (params.has('challenge')) {
+  const f = document.createElement('form'); f.action='/sorry/'; document.body.append(f);
+}
+function choose(name) {
+  if (!params.has('unconfirmed')) document.querySelector('[data-test-id="bard-mode-menu-button"]').textContent=name;
+  menu.hidden=true;
+}
+document.addEventListener('keydown', e => {if(e.key==='Escape') menu.hidden=true;});
+function generate() {
+  if (params.has('quota')) {
+    const q = document.createElement('div'); q.dataset.testId='usage-limit-reached';
+    document.body.append(q); return;
+  }
+  const response=document.createElement('model-response');
+  response.innerHTML='<div class="markdown"></div>';
+  document.body.append(response);
+  const stop=document.createElement('button'); stop.dataset.testId='stop-button';
+  document.body.append(stop);
+  const text=response.querySelector('.markdown');
+  setTimeout(()=>text.textContent='Hello', 70);
+  if(params.has('hang')) return;
+  setTimeout(()=>text.textContent=params.has('rewrite') ? 'Different' : 'Hello browser', 380);
+  setTimeout(()=>{
+    stop.remove(); const copy=document.createElement('button'); copy.setAttribute('aria-label','Copy');
+    response.append(copy);
+  }, 600);
+}
+</script></body></html>

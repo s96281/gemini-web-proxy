@@ -1,0 +1,14 @@
+.venv
+.browsers
+.git
+.agents
+.aws
+.codex
+shared
+.env
+state
+__pycache__
+**/__pycache__
+.pytest_cache
+.ruff_cache
+*.egg-info

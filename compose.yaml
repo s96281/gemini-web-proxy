@@ -1,0 +1,17 @@
+services:
+  proxy:
+    build: .
+    init: true
+    user: "${LOCAL_UID:-10001}:${LOCAL_GID:-10001}"
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./state:/app/state
+    shm_size: 1gb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
