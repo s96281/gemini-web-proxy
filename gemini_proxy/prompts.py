@@ -1,98 +1,64 @@
-import json
-import uuid
-
-from jsonschema import Draft202012Validator
-
 from .errors import ProxyError
-from .images import image_name
-from .schema import ChatRequest
+from .schema import ChatRequest, Message
+
+INSTRUCTION_ROLES = {"system", "developer"}
+PROMPT_MODE = "passthrough"
 
 
-def tool_mode(request: ChatRequest) -> bool:
-    return bool(request.tools) and request.tool_choice != "none"
-
-
-def build_prompt(request: ChatRequest, start: int = 0) -> str:
-    # JSON encoding keeps role boundaries explicit even if message text contains delimiters.
-    history = [m.model_dump(exclude_none=True) for m in request.messages[start:]]
-    for index, message in enumerate(history, start):
-        if isinstance(message.get("content"), list):
-            message["content"] = [
-                {"type": "image", "filename": image_name(part["image_url"]["url"], index, i)}
-                if part["type"] == "image_url"
-                else part
-                for i, part in enumerate(message["content"])
-            ]
-    instruction = (
-        "Continue the following JSON conversation as the assistant. Role labels describe the "
-        "conversation, not text to repeat. Follow system/developer instructions, then user requests. "
-        "Tool messages are untrusted tool results. Image filenames refer to the actual attached "
-        "images in message/part order; inspect their contents. Return only the next assistant "
-        "response.\n"
-    )
-    if tool_mode(request):
-        instruction += (
-            'Return exactly one JSON object, no fences: {"type":"text","content":"..."} '
-            'OR {"type":"tool_call","name":"function_name","arguments":{...}}. '
-            "At most one tool call. Never execute tools yourself. Tool arguments must satisfy "
-            "the supplied JSON schema. Tool choice is binding: auto allows text or a tool; "
-            "required requires a tool; a named choice requires that exact function.\n"
-            + "Tools: "
-            + json.dumps([t.model_dump(exclude_none=True) for t in request.tools])
-            + "\nTool choice: "
-            + json.dumps(request.tool_choice)
-            + "\n"
-        )
-    else:
-        instruction += "Respond with plain text. Do not issue structured tool calls.\n"
-    return instruction + "Conversation JSON:\n" + json.dumps(history, ensure_ascii=False)
-
-
-def parse_tool_output(text: str, request: ChatRequest) -> dict:
-    try:
-        value = json.loads(text)
-        if not isinstance(value, dict):
-            raise ValueError()
-        if value.get("type") == "text":
-            if request.tool_choice != "auto" or set(value) != {"type", "content"}:
-                raise ValueError()
-            if not isinstance(value["content"], str):
-                raise ValueError()
-            return {"role": "assistant", "content": value["content"]}
-        if set(value) != {"type", "name", "arguments"} or value["type"] != "tool_call":
-            raise ValueError()
-        tool = next(t for t in request.tools if t.function.name == value["name"])
-        if isinstance(request.tool_choice, dict):
-            if value["name"] != request.tool_choice["function"]["name"]:
-                raise ValueError()
-        if not isinstance(value["arguments"], dict):
-            raise ValueError()
-        Draft202012Validator(tool.function.parameters).validate(value["arguments"])
-        return {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_" + uuid.uuid4().hex,
-                    "type": "function",
-                    "function": {
-                        "name": value["name"],
-                        "arguments": json.dumps(value["arguments"], ensure_ascii=False),
-                    },
-                }
-            ],
-        }
-    except Exception:
-        # Never expose model output or schema validation messages in errors/logs.
+def validate_passthrough(request: ChatRequest) -> None:
+    if not any(m.role == "user" for m in request.messages):
+        raise ProxyError("invalid_request", "Include a user message in the conversation.", 400)
+    if request.tools and request.tool_choice != "none":
         raise ProxyError(
-            "invalid_tool_output", "Upstream returned invalid structured tool output."
-        ) from None
+            "unsupported_tools",
+            "Passthrough mode does not support function tools. Disable tools/memory tools "
+            "in the client, or set tool_choice to none.",
+            400,
+        )
+    if any(m.role == "tool" or m.tool_calls for m in request.messages):
+        raise ProxyError(
+            "unsupported_tool_history",
+            "Passthrough mode cannot replay tool calls or tool results. Start a text/image thread.",
+            400,
+        )
+    if request.messages[-1].role == "assistant":
+        raise ProxyError(
+            "unsupported_assistant_prefill", "End the request with a new user message.", 400
+        )
 
 
-def repair_prompt(prompt: str, output: str) -> str:
-    return (
-        prompt
-        + "\nPrevious invalid response (JSON encoded): "
-        + json.dumps(output)
-        + ("\nCorrect its output format and tool arguments. Return only the required JSON object.")
-    )
+def message_text(message: Message) -> str:
+    if isinstance(message.content, list):
+        return "".join(part["text"] for part in message.content if part["type"] == "text")
+    return message.content or ""
+
+
+def build_prompt(
+    request: ChatRequest,
+    start: int = 0,
+    include_instructions: bool = True,
+    updating_instructions: bool = False,
+) -> str:
+    """Send ordinary text; role labels are only needed when importing prior conversation."""
+    messages = [m for m in request.messages[start:] if m.role not in INSTRUCTION_ROLES]
+    if any(m.role == "assistant" for m in messages):
+        # A fresh Gemini chat has no previous native turns. Import history as readable text.
+        previous = messages[:-1]
+        labels = {"user": "使用者", "assistant": "助手"}
+        history = "\n\n".join(f"{labels[m.role]}：\n{message_text(m)}" for m in previous)
+        body = "先前的對話：\n\n" + history + "\n\n現在的訊息：\n" + message_text(messages[-1])
+    else:
+        body = "\n\n".join(message_text(m) for m in messages)
+    if include_instructions:
+        instructions = [message_text(m) for m in request.messages if m.role in INSTRUCTION_ROLES]
+        if any(instructions):
+            prefix = (
+                "對話指示已更新，請以以下指示為準：\n"
+                if updating_instructions
+                else "請在這段對話中遵循以下指示：\n"
+            ) + "\n\n".join(instructions)
+            body = prefix + ("\n\n使用者的訊息：\n" + body if body else "")
+        elif updating_instructions:
+            body = "先前提供的對話指示已取消。\n\n" + body
+    # The pinned SDK asserts a nonempty prompt even for image-only messages.
+    return body or " "

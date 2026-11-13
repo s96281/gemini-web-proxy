@@ -2,7 +2,15 @@
 
 供個人自架使用的 Gemini Web App 轉接服務，提供 OpenAI Chat Completions API。使用一般（非臨時）對話，支援接續同一個 Gemini 對話串。優先使用自己的 Gemini Cookie；新對話只有在**生成送出前**確認主後端不可用時，才改用已登入的 Chromium 操作網頁。
 
-支援文字與圖片輸入、多輪完整歷史、SSE 串流、單輪單一 function tool call。工具在客戶端執行。使用 Python 3.12+、FastAPI、`gemini-webapi==2.1.1`、Playwright；網頁協定與 DOM 變更可能需要更新適配器。
+目前採用直通模式，支援文字與圖片輸入、多輪完整歷史及 SSE 串流；不提供 function tool calls。使用 Python 3.12+、FastAPI、`gemini-webapi==2.1.1`、Playwright；網頁協定與 DOM 變更可能需要更新適配器。
+
+## 直通模式
+
+單一 user 文字會原樣送入 Gemini，不加角色 JSON、工具定義或輸出格式要求。system／developer 以「請在這段對話中遵循以下指示」開頭，與第一輪問題一起送出；後續只送新增文字和圖片。若指示更新，會用普通文字告知以新指示為準；移除指示則補入取消說明。這仍是對話文字，不能真正刪除已存在的上游上下文，也不保證與官方 system channel 相同的優先權。
+
+API 的 `messages`／Chat Completions JSON 和 SSE 包裝仍由代理處理，Gemini 可以自由回答。移除代理要求能減少干擾，尚未用真實帳號測量與手動網頁的效果差異。
+
+**從舊版升級時，請關閉客戶端的工具／記憶工具，建立新的聊天與新的 `conversation_id`。** 舊串已含結構化提示，指定該 ID 會回傳 `conversation_mode_changed`（409）；未指定 ID 時只自動匹配直通串，不續接舊結構化串。既有 `state` 不需刪除，仍可查閱舊串的歷史診斷；`prompt_mode` 可辨識 `structured` 與 `passthrough`。若傳入舊完整歷史，內容仍會以文字帶入新串；要完全排除舊提示／回答的影響，請使用乾淨的新 `messages`。
 
 ## 本機啟動
 
@@ -78,15 +86,15 @@ GP_BROWSER_MODEL_MAP={"your-cookie-model-id":"Exact UI label"}
 | 已有對話的後端不可用 | 回報錯誤，不跨後端建立另一串 |
 | 生成已送出、結果不明、部分文字已回傳 | 不切換、不自動重送 |
 | 額度限制、封鎖／驗證挑戰、模型不存在 | 回報錯誤，不自動重送 |
-| 工具回覆格式或參數不合法 | 在同一個 Gemini 對話內修復一次；仍無效則失敗 |
+| 客戶端要求 function tools／記憶工具 | 回報 `unsupported_tools`（400），不送出生成 |
 
 SDK 內部的生成重試已停用，並有針對固定版本裝飾器的測試。客戶端也應關閉自動重試，例如 OpenAI SDK 的 `max_retries=0`。取消請求會釋放資源，但不能保證已送往 Google 的生成在伺服器端停止或不計額度。
 
 ## 接續對話與網頁歷史
 
-Cookie 後端使用 `temporary=False`，保存 Gemini 的 chat/reply/candidate metadata；瀏覽器後端保存對話網址。拿到對話 metadata 僅代表可嘗試續接，**不能保證該串已列在 Gemini 網頁歷史中**；實際顯示與保存須在同一個 Google 帳號下驗證。網頁裡會看到代理送出的角色 JSON 與提示指示，不是原生 API 的分角色訊息。
+Cookie 後端使用 `temporary=False`，保存 Gemini 的 chat/reply/candidate metadata；瀏覽器後端保存對話網址。拿到對話 metadata 僅代表可嘗試續接，**不能保證該串已列在 Gemini 網頁歷史中**；實際顯示與保存須在同一個 Google 帳號下驗證。網頁收到一般文字與圖片附件；API 回應的 JSON 包裝由代理完成，不會要求 Gemini 用指定 JSON 結構回答。
 
-每次請求仍須傳完整 `messages`，包含代理上一輪回傳的 assistant 訊息（或 tool_calls）以及新增的 user／tool 訊息。若歷史前綴與已完成的對話完全吻合，服務會自動找到該串，只把新增訊息送入 Gemini；新工具定義及輸出要求仍會隨每輪送出。
+每次請求仍須傳完整 `messages`，包含代理上一輪回傳的 assistant 訊息及新增的 user 訊息。服務比對 user／assistant 歷史前綴，自動找到已完成的同一串，只把新增內容送入 Gemini。system／developer 指示另外比對，首次附入，之後只有改動才補入；修改、增加或移除指示不會因此換串。
 
 建議客戶端明確指定 `conversation_id`（本服務擴充欄位），同一串沿用相同 ID。OpenAI Python SDK 可用 `extra_body` 傳入：
 
@@ -108,17 +116,18 @@ second = client.chat.completions.create(
 
 未指定 ID 的新對話會獲配隨機 ID；成功回應的 `X-Conversation-ID` header 可供後續請求使用，串流回應也有此 header。兩個新請求即使問題相同，也會建立不同對話；若連同回答都相同，後續自動辨識會回報 `conversation_ambiguous`（409），需明確指定 ID。
 
-指定既有 ID 時，切換模型、修改／刪除舊歷史、只傳新問題或重送同一輪，會回報 `conversation_conflict`（409）。請使用新 ID 建立分支。生成失敗、取消或程序在生成期間中止時，該串會標記為結果不明，之後回報 `conversation_uncertain`（409）；請先在網頁確認，再以新 ID 建立對話，不會自動重送。已有串固定使用最初的後端，不會因 Cookie 恢復或失效而跨後端續接。也不要同時在網頁手動編輯 API 使用中的對話。
+指定既有 ID 時，切換模型、修改／刪除舊 user／assistant 歷史、只傳新問題或重送同一輪，會回報 `conversation_conflict`（409）；system／developer 指示可更新。請使用新 ID 建立分支。生成失敗、取消或程序在生成期間中止時，該串會標記為結果不明，之後回報 `conversation_uncertain`（409）；請先在網頁確認，再以新 ID 建立對話，不會自動重送。已有串固定使用最初的後端，不會因 Cookie 恢復或失效而跨後端續接。也不要同時在網頁手動編輯 API 使用中的對話。
 
 對應資料預設存於 `state/conversations.json`，只包含對話 ID、Gemini metadata／網址、訊息雜湊與狀態，不保存提示或回答明文；需與 Cookie 一起妥善保存並掛載整個 `state`，服務重啟後才能接續。預設保留最近更新的 256 串，可用 `GP_MAX_CONVERSATIONS` 調整；刪除對應檔或較舊項目被淘汰後，下次請求會用完整歷史建立新的 Gemini 串，即使沿用原 ID。只支援單一 process／worker。
 
 ### 網頁找不到純文字對話時
 
-此問題與是否附圖無關。先確認 `GET /health/live` 的 `capabilities` 含 `persistent_conversations` 與 `history_diagnostics`；沒有表示目前執行的程式尚未更新到此版本，或連到另一個服務。更新程式後須重啟原本的 `gemini-proxy serve` process。
+此問題與是否附圖無關。先確認 `GET /health/live` 的 `capabilities` 含 `persistent_conversations`、`passthrough` 與 `history_diagnostics`；沒有表示目前執行的程式尚未更新到此版本，或連到另一個服務。更新程式後須重啟原本的 `gemini-proxy serve` process。
 
 以 Bearer Key 呼叫 `GET /v1/conversations`，可列出本機對話 ID（最近更新的在前）。再呼叫 `GET /v1/conversations/<ID>`，取得：
 
 - `gemini_chat_url`：Gemini 原對話網址，請以 Cookie 所屬的 Google 帳號開啟；如果瀏覽器同時登入多個帳號，務必確認帳號。
+- `prompt_mode`：`passthrough` 為直通串，`structured` 為舊版串。
 - `backend`：實際使用 `cookie` 或 `browser`；瀏覽器 profile 與匯入的 Cookie 可能屬於不同帳號。
 - `local_state`：代理本機這一輪是否完成，**不代表** Google 已保存歷史。
 - `listed_in_recent_history`：Cookie 後端重新向 Google 查詢近期 50 串及釘選清單後，是否找到此 ID。`true` 表示已列出，`false` 表示本次清單沒有，`null` 表示未知／查詢不可用；沒有列出也可能只是已不在近期範圍。
@@ -145,7 +154,7 @@ if ($threads.Count -gt 0) {
 
 圖片會解碼並驗證 base64、MIME 檔頭與大小，再實際上傳。Cookie 後端使用具正確副檔名的暫存檔傳入 SDK `files`（正常完成、失敗與取消時清理）；瀏覽器後端使用 file input／檔案選擇器附圖，確認所有檔名的預覽已出現且上傳進度消失後才送出訊息。圖片格式完整性及模型可用性仍由 Gemini 判定；瀏覽器 UI 的 selector 需與線上介面核對。
 
-文字提示只保留附件檔名與訊息順序，不包含 base64。已辨識的同一對話只上傳新增訊息裡的圖片，舊圖留在 Gemini 上游對話；工具格式修復不重複附圖。對話對應檔也不保存圖片或 base64。Google／瀏覽器 profile 的附件保存遵循上游行為。
+使用者文字原樣送出，圖片按出現順序附加，不把檔名標記或 base64 塞進提示。純圖片輸入因固定 SDK 要求非空 prompt，會帶一個空白字元，不額外加入描述圖片的指令。已辨識的同一對話只上傳新增訊息裡的圖片，舊圖留在 Gemini 上游對話。對話對應檔也不保存圖片或 base64。Google／瀏覽器 profile 的附件保存遵循上游行為。
 
 ```python
 import base64
@@ -161,9 +170,9 @@ response = client.chat.completions.create(
 )
 ```
 
-預設每次最多新增 8 張、單張 10,000,000 bytes、合計 20,000,000 bytes，整個 JSON body 上限為 32,000,000 bytes（含完整歷史及 base64 約 4/3 的編碼開銷）。**既有 `.env` 若仍有 `GP_MAX_REQUEST_BYTES=2000000`，需調高並重啟服務**，否則大圖會在解析前回傳 413。圖片可搭配一般文字、SSE 與 function tools 使用。
+預設每次最多新增 8 張、單張 10,000,000 bytes、合計 20,000,000 bytes，整個 JSON body 上限為 32,000,000 bytes（含完整歷史及 base64 約 4/3 的編碼開銷）。**既有 `.env` 若仍有 `GP_MAX_REQUEST_BYTES=2000000`，需調高並重啟服務**，否則大圖會在解析前回傳 413。圖片可搭配一般文字與 SSE 使用。
 
-## OpenAI SDK 與 Agent
+## OpenAI SDK 與聊天客戶端
 
 先安裝 `pip install openai`。使用自己的 `.env` 金鑰與 `/v1/models` 查得的 ID：
 
@@ -184,25 +193,25 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-串流可參考 `examples/chat.py`；工具呼叫往返可參考 `examples/agent.py`。這兩個範例從環境變數讀取 `GP_API_KEY`，執行前請在自己的終端機設定該變數。
+串流可參考 `examples/chat.py`；system 指示與兩輪續接可參考 `examples/conversation.py`。這兩個範例從環境變數讀取 `GP_API_KEY`，執行前請在自己的終端機設定該變數。
 
 ```bash
 python examples/chat.py --model your-model-id
-python examples/agent.py --model your-model-id
+python examples/conversation.py --model your-model-id
 ```
 
-Cline：選擇 **OpenAI Compatible** provider，Base URL 設為 `http://127.0.0.1:8000/v1`，填入代理 Key 與實際 model ID，使用 Chat Completions。能調整時，關閉平行工具呼叫與自動重試。不同版本可能預設傳送 `temperature`、`max_tokens` 或其他控制欄位；本服務會拒絕它們，需讓客戶端停用／省略後才能相容。原生 tools 模式使用 function tools；XML 工具模式視為普通文字，由客戶端自行解析。
+聊天客戶端選擇 **OpenAI Compatible** provider，Base URL 設為 `http://127.0.0.1:8000/v1`，填入代理 Key 與實際 model ID，使用 Chat Completions。請關閉 function tools、記憶工具與自動重試；直通模式不支援依賴原生工具呼叫的 Cline Agent 工作流程。客戶端若預設傳送 `temperature`、`max_tokens` 或其他未支援控制欄位，需讓客戶端停用／省略後才能相容。
 
 Cline 的實際 GUI 串接與登入帳號測試尚待使用者環境驗收，不能把 SDK 模擬測試當成 Cline 實測。
 
 ## 支援介面與限制
 
 - `POST /v1/chat/completions`：`model`、`messages`、`stream`、`tools`、`tool_choice`、`parallel_tool_calls=false`、`n=1`，以及選填擴充欄位 `conversation_id`。`stream_options` 接受空物件或布林值 `include_usage`（含 `true`）；因上游沒有可靠用量，回應仍省略 usage，不產生虛構 token 統計。
-- 訊息支援 system、developer、user、assistant、tool；content 可為字串或純文字 parts，user 訊息另支援 base64 `image_url` parts。工具結果的 `tool_call_id` 必須對應尚未回覆的 assistant tool call。
-- 工具支援 function schema 與 auto／none／required／指定函式。參數需為 JSON object，拒絕外部 schema reference；不支援 `strict=true`。schema 驗證不是原生 constrained decoding 的保證。
+- 訊息支援 system、developer、user、assistant；content 可為字串或純文字 parts，user 訊息另支援 base64 `image_url` parts。必須含 user 訊息，不支援以 assistant 訊息結尾的預填續寫。
+- `tools` 請省略或傳空陣列。若客戶端仍傳工具定義，需設定 `tool_choice="none"`，這些定義不會送入 Gemini；有效的工具請求回傳 `unsupported_tools`（400）。歷史含 tool_calls 或 tool 結果回傳 `unsupported_tool_history`（400），請建立純文字／圖片新串。
 - 新對話送出完整歷史；已辨識的後續請求使用原本的 Gemini 對話，只送新增訊息。Cookie 使用非臨時對話，兩個後端皆保存接續所需的對應資料。
-- system/developer 指示、歷史與工具定義序列化至網頁提示，不具備原生 system channel 同等的優先權保證。工具轉換依賴模型遵循格式，可能失敗；代理不會執行模型生成的工具或命令。
-- 一般文字使用增量串流；工具模式緩衝至完整內容通過驗證後，才回傳文字或 tool_calls 串流事件。每輪最多一個工具呼叫，工具 arguments 是 JSON 字串。
+- system／developer 以自然語言放進一般對話，沒有官方 system channel 的特殊優先權。新建 Gemini 對話若帶入先前歷史，以可讀的文字對話重播一次；既有串不重播已完成歷史。
+- 回答直接增量串流，不解析 JSON、不進行格式修復或工具轉換。Markdown、程式碼、JSON 等模型實際產生的文字均保留在 assistant content 中。
 - 不提供不可靠的 token usage。沒有 Responses API、Codex CLI、音訊／影片輸入、多人帳號池或管理 UI。temperature、top_p、max_tokens、stop、response_format 等未支援欄位會回傳 400，避免默默忽略。
 - 一般錯誤使用 `{"error":{"message":...,"type":...,"param":null,"code":...}}`。第一筆內容前的錯誤以對應 HTTP 狀態回應；串流途中失敗發出 `data: {"error":...}` 後關閉，不發送成功 finish 或 `[DONE]`。成功串流以 `[DONE]` 結束。
 
@@ -222,7 +231,7 @@ Cline 的實際 GUI 串接與登入帳號測試尚待使用者環境驗收，不
 | `GP_BROWSER_SELECTORS_FILE` | 選填，覆寫 DOM selector 的 JSON 檔 |
 | `GP_BROWSER_EXECUTABLE` | 選填，自訂 Chromium 執行檔 |
 | `GP_UPSTREAM_PROXY` | 選填，Cookie 與瀏覽器共用的 HTTP proxy URL |
-| `GP_REQUEST_TIMEOUT` | 300 秒，取得執行位置後含準備、生成及格式修復 |
+| `GP_REQUEST_TIMEOUT` | 300 秒，取得執行位置後含準備、上傳及生成 |
 | `GP_PREFLIGHT_TIMEOUT` | 30 秒，上游初始化或瀏覽器準備 |
 | `GP_QUEUE_TIMEOUT` / `GP_MAX_QUEUE` | 30 秒 / 8 個等待者；單帳號一次一個請求 |
 | `GP_MAX_REQUEST_BYTES` / `GP_MAX_OUTPUT_CHARS` | 32,000,000 bytes / 1,000,000 字元 |
@@ -246,9 +255,9 @@ ruff check gemini_proxy tests examples
 ruff format --check gemini_proxy tests examples
 ```
 
-測試使用模擬 Cookie client、OpenAI Python SDK，以及本機 HTML fixture 上的真實 Chromium，涵蓋文字／串流、工具呼叫往返與一次修復、schema 驗證、對話隔離、錯誤格式、備援限制、登入／模型選取、佇列、逾時與取消。不會連入真實 Google 帳號。
+測試使用模擬 Cookie client、OpenAI Python SDK，以及本機 HTML fixture 上的真實 Chromium，涵蓋原文直通、指示首次附入與更新、文字／圖片／串流、工具請求拒絕、schema 驗證、對話隔離、錯誤格式、備援限制、登入／模型選取、佇列、逾時與取消。不會連入真實 Google 帳號。
 
-目前已驗證固定 SDK 的介面與無生成重試行為；**尚未驗證真實 Gemini 帳號、目前線上 DOM 或 Cline GUI**。部署後請依序實測 `/v1/models`、文字與串流、`examples/agent.py`，並用相同 `conversation_id` 及完整歷史連續問兩輪，確認 Gemini 網頁只有同一串；重啟服務後再問第三輪，確認仍接續。再停止服務並暫時移走 Cookie 檔後重啟，以**新的**對話 ID 驗證自己的瀏覽器登入及精確模型對應，並重複續接驗收。完成後恢復 Cookie。不要以注入串流中斷的方式測試自動重送，服務刻意不支援該行為。
+目前已驗證固定 SDK 的介面與無生成重試行為；**尚未驗證真實 Gemini 帳號、目前線上 DOM 或 Cline GUI**。部署後請依序實測 `/v1/models`、文字與串流、`examples/conversation.py`，並用相同 `conversation_id` 及完整歷史連續問兩輪，確認 Gemini 網頁只有同一串；重啟服務後再問第三輪，確認仍接續。再停止服務並暫時移走 Cookie 檔後重啟，以**新的**對話 ID 驗證自己的瀏覽器登入及精確模型對應，並重複續接驗收。完成後恢復 Cookie。不要以注入串流中斷的方式測試自動重送，服務刻意不支援該行為。
 
 更新依賴時用 `uv pip compile pyproject.toml -o requirements.lock` 重新鎖定，並重新跑全部測試，特別檢查 SDK 的私有 `_generate` 重試裝飾器與瀏覽器完成判定。
 

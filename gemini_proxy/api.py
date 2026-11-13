@@ -204,6 +204,7 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
             "status": "ok",
             "capabilities": [
                 "persistent_conversations",
+                "passthrough",
                 "base64_image_uploads",
                 "history_diagnostics",
             ],
@@ -281,17 +282,14 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
                 async def collect():
                     event = first
                     text = []
-                    message = None
                     while event[0] != "end":
                         kind, value = event
                         if kind == "error":
                             raise value
                         if kind == "text":
                             text.append(value)
-                        if kind == "message":
-                            message = value
                         event = await session.next()
-                    return message or {"role": "assistant", "content": "".join(text)}
+                    return {"role": "assistant", "content": "".join(text)}
 
                 message = await connected(request, collect())
                 return JSONResponse(
@@ -304,9 +302,7 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
                             {
                                 "index": 0,
                                 "message": message,
-                                "finish_reason": "tool_calls"
-                                if message.get("tool_calls")
-                                else "stop",
+                                "finish_reason": "stop",
                             }
                         ],
                     },
@@ -317,7 +313,6 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
                 try:
                     yield sse(chunk({"role": "assistant"}))
                     event = first
-                    finish = "stop"
                     while event[0] != "end":
                         kind, value = event
                         if kind == "error":
@@ -325,18 +320,8 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
                             return  # No success marker / [DONE] after a partial failure.
                         if kind == "text":
                             yield sse(chunk({"content": value}))
-                        if kind == "message":
-                            if value.get("tool_calls"):
-                                finish = "tool_calls"
-                                calls = [
-                                    dict(call, index=i)
-                                    for i, call in enumerate(value["tool_calls"])
-                                ]
-                                yield sse(chunk({"tool_calls": calls}))
-                            else:
-                                yield sse(chunk({"content": value["content"]}))
                         event = await session.next()
-                    yield sse(chunk({}, finish))
+                    yield sse(chunk({}, "stop"))
                     yield "data: [DONE]\n\n"
                 finally:
                     await session.close()

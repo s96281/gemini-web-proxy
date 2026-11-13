@@ -141,6 +141,7 @@ async def test_browser_uploads_actual_images_then_continues_without_reupload(bro
         first = await client.post("/v1/chat/completions", json=body)
         assert first.status_code == 200
         uploaded = await browser.page.evaluate("window.sentImages")
+        assert await browser.page.locator("textarea").input_value() == "What is this image?"
         assert len(uploaded) == 1 and uploaded[0]["bytes"] == list(PNG)
         assert uploaded[0]["type"] == "image/png" and uploaded[0]["name"].endswith(".png")
         assert not await browser.page.evaluate("window.sentWhileUploading")
@@ -149,6 +150,7 @@ async def test_browser_uploads_actual_images_then_continues_without_reupload(bro
             "/v1/chat/completions", json=followup(body, first.json()["choices"][0]["message"])
         )
         assert second.status_code == 200 and browser.page.url == url
+        assert await browser.page.locator("textarea").input_value() == "next question"
         assert await browser.page.evaluate("window.sentImages") == []
 
 

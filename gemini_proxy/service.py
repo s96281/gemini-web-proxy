@@ -7,7 +7,7 @@ from contextlib import aclosing, asynccontextmanager
 from .conversations import Conversations, fingerprints
 from .errors import ProxyError
 from .images import prepare_images
-from .prompts import build_prompt, parse_tool_output, repair_prompt, tool_mode
+from .prompts import INSTRUCTION_ROLES, PROMPT_MODE, build_prompt, validate_passthrough
 
 log = logging.getLogger("gemini_proxy")
 
@@ -79,6 +79,7 @@ class Service:
             "model": entry["model"],
             "local_state": "completed" if entry["valid"] else "uncertain",
             "temporary": False,
+            "prompt_mode": entry.get("prompt_mode", "structured"),
             "gemini_chat_url": url,
             "listed_in_recent_history": None,
             "latest_turn_readable": None,
@@ -109,22 +110,8 @@ class Service:
             await self.abort_backend(candidate)
             raise
 
-    async def collect(self, backend, prompt, model, state, images=None):
-        pieces = []
-        size = 0
-        async with aclosing(backend.stream(prompt, model, state, images=images)) as outputs:
-            async for text in outputs:
-                size += len(text)
-                if size > self.settings.max_output_chars:
-                    raise ProxyError("output_too_large", "Upstream response exceeded output limit.")
-                pieces.append(text)
-        text = "".join(pieces)
-        if not text:
-            raise ProxyError("empty_response", "Gemini returned no text.")
-        return text
-
     async def events(self, request, request_id):
-        """Yield ('text', delta) or ('message', validated message); hold slot for whole stream."""
+        """Yield raw text deltas and hold the upstream slot for the whole stream."""
         started = time.monotonic()
         backend = None
         outcome = "ok"
@@ -132,10 +119,29 @@ class Service:
             async with self.slot():
                 try:
                     async with asyncio.timeout(self.settings.request_timeout):
+                        validate_passthrough(request)
                         entry, hashes = self.conversations.resolve(request)
-                        start = len(entry["hashes"]) if entry else 0
+                        dialogue_indices = [
+                            i
+                            for i, m in enumerate(request.messages)
+                            if m.role not in INSTRUCTION_ROLES
+                        ]
+                        start = dialogue_indices[len(entry["hashes"]) - 1] + 1 if entry else 0
+                        instruction_hashes = fingerprints(
+                            [m for m in request.messages if m.role in INSTRUCTION_ROLES]
+                        )
+                        changed = entry is None or instruction_hashes != entry["instruction_hashes"]
                         images = prepare_images(request, start, self.settings)
-                        prompt = build_prompt(request, start)
+                        prompt = build_prompt(
+                            request,
+                            start,
+                            include_instructions=changed,
+                            updating_instructions=entry is not None and changed,
+                        )
+                        if not prompt.strip() and not images:
+                            raise ProxyError(
+                                "empty_prompt", "Provide text instructions or images.", 400
+                            )
                         backend = await self.select(request.model, request_id, entry)
                         state = dict(entry["state"]) if entry else {}
                         # Persist uncertainty before dispatch, including process crashes.
@@ -145,48 +151,29 @@ class Service:
                             "state": state,
                             "hashes": entry["hashes"] if entry else hashes,
                             "valid": False,
+                            "prompt_mode": PROMPT_MODE,
+                            "instruction_hashes": instruction_hashes,
                         }
                         self.conversations.save(request.conversation_id, entry)
-                        if tool_mode(request):
-                            raw = await self.collect(backend, prompt, request.model, state, images)
-                            try:
-                                message = parse_tool_output(raw, request)
-                            except ProxyError:
-                                # Intentional format repair only, never transport recovery.
-                                await backend.prepare(request.model, state)
-                                raw = await self.collect(
-                                    backend,
-                                    repair_prompt(
-                                        build_prompt(request, len(request.messages)), raw
-                                    ),
-                                    request.model,
-                                    state,
-                                )
-                                message = parse_tool_output(raw, request)
-                            self.commit(request, entry, hashes, message)
-                            yield "message", message
-                        else:
-                            size = 0
-                            pieces = []
-                            async with aclosing(
-                                backend.stream(prompt, request.model, state, images=images)
-                            ) as outputs:
-                                async for text in outputs:
-                                    size += len(text)
-                                    if size > self.settings.max_output_chars:
-                                        raise ProxyError(
-                                            "output_too_large", "Output limit exceeded."
-                                        )
-                                    pieces.append(text)
-                                    yield "text", text
-                            if not size:
-                                raise ProxyError("empty_response", "Gemini returned no text.")
-                            self.commit(
-                                request,
-                                entry,
-                                hashes,
-                                {"role": "assistant", "content": "".join(pieces)},
-                            )
+                        size = 0
+                        pieces = []
+                        async with aclosing(
+                            backend.stream(prompt, request.model, state, images=images)
+                        ) as outputs:
+                            async for text in outputs:
+                                size += len(text)
+                                if size > self.settings.max_output_chars:
+                                    raise ProxyError("output_too_large", "Output limit exceeded.")
+                                pieces.append(text)
+                                yield "text", text
+                        if not size:
+                            raise ProxyError("empty_response", "Gemini returned no text.")
+                        self.commit(
+                            request,
+                            entry,
+                            hashes,
+                            {"role": "assistant", "content": "".join(pieces)},
+                        )
                 except BaseException:
                     # Abort on failure/cancellation while holding the slot, before next request.
                     if backend is not None:

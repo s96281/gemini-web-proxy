@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import json
 from pathlib import Path
 
 import pytest
@@ -13,7 +12,7 @@ from gemini_proxy.images import prepare_images
 from gemini_proxy.schema import ChatRequest
 
 from .conftest import FakeBackend
-from .test_api import BASIC, CALL, TOOL
+from .test_api import BASIC
 from .test_conversations import followup
 from .test_cookie import Client
 
@@ -44,7 +43,7 @@ async def test_images_reach_backend_as_bytes_not_prompt_text(make_client, stream
     assert response.status_code == 200
     image = backend.images[0][0]
     assert image.data == PNG and image.mime_type == "image/png" and image.name.endswith(".png")
-    assert image.name in backend.prompts[0]
+    assert image.name not in backend.prompts[0]
     assert IMAGE_URL not in backend.prompts[0]
     assert "What is this image?" in backend.prompts[0]
     assert "base64" not in settings.conversation_file.read_text()
@@ -63,8 +62,7 @@ async def test_image_only_and_multiple_images_preserve_attachment_order(make_cli
     assert response.status_code == 200
     assert len(backend.images[0]) == 2
     assert backend.images[0][0].name != backend.images[0][1].name
-    parts = json.loads(backend.prompts[0].split("Conversation JSON:\n")[1])[0]["content"]
-    assert [p["filename"] for p in parts] == [image.name for image in backend.images[0]]
+    assert backend.prompts[0] == " "  # SDK requires a nonempty prompt for image-only input.
 
 
 async def test_history_images_are_not_reuploaded_but_new_images_are(make_client):
@@ -88,15 +86,6 @@ async def test_history_images_are_not_reuploaded_but_new_images_are(make_client)
     assert [len(images) for images in backend.images] == [1, 0, 1]
     assert backend.images[2][0].name != backend.images[0][0].name
     assert third.headers["X-Conversation-ID"] == first.headers["X-Conversation-ID"]
-
-
-async def test_image_with_tools_repairs_without_reupload(make_client):
-    http, _, backend = make_client(FakeBackend([["bad"], [CALL]]))
-    async with http:
-        result = await http.post(URL, json=IMAGE_REQUEST | {"tools": [TOOL]})
-    assert result.status_code == 200
-    assert result.json()["choices"][0]["message"]["tool_calls"]
-    assert [len(images) for images in backend.images] == [1, 0]
 
 
 @pytest.mark.parametrize(

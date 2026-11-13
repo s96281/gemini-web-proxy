@@ -21,7 +21,6 @@ TOOL = {
         },
     },
 }
-CALL = json.dumps({"type": "tool_call", "name": "get_weather", "arguments": {"city": "Taipei"}})
 
 
 async def test_sdk_text_stream_and_models(make_client):
@@ -59,69 +58,7 @@ async def test_auth_validation_and_health(make_client):
         assert not backend.prompts
 
 
-async def test_full_tool_round_trip_via_sdk(make_client):
-    http, _, backend = make_client(FakeBackend([[CALL], ['{"type":"text","content":"晴天"}']]))
-    async with AsyncOpenAI(
-        api_key=KEY, base_url="http://test/v1", http_client=http, max_retries=0
-    ) as sdk:
-        history = BASIC["messages"].copy()
-        response = await sdk.chat.completions.create(
-            model="gemini-test", messages=history, tools=[TOOL], tool_choice="required"
-        )
-        choice = response.choices[0]
-        assert choice.finish_reason == "tool_calls"
-        call = choice.message.tool_calls[0]
-        assert json.loads(call.function.arguments) == {"city": "Taipei"}
-        history += [
-            choice.message.model_dump(exclude_none=True),
-            {"role": "tool", "tool_call_id": call.id, "content": "晴天"},
-        ]
-        answer = await sdk.chat.completions.create(
-            model="gemini-test", messages=history, tools=[TOOL]
-        )
-        assert answer.choices[0].message.content == "晴天"
-        assert call.id in backend.prompts[1]
-        assert '"role": "tool"' in backend.prompts[1]
-
-
-async def test_validated_tool_stream(make_client):
-    http, _, _ = make_client(FakeBackend([[CALL[:20], CALL[20:]]]))
-    async with AsyncOpenAI(api_key=KEY, base_url="http://test/v1", http_client=http) as sdk:
-        chunks = [
-            c
-            async for c in await sdk.chat.completions.create(
-                **BASIC,
-                tools=[TOOL],
-                tool_choice={"type": "function", "function": {"name": "get_weather"}},
-                stream=True,
-            )
-        ]
-        calls = [c.choices[0].delta.tool_calls for c in chunks if c.choices[0].delta.tool_calls]
-        assert len(calls) == 1
-        assert calls[0][0].index == 0
-        assert calls[0][0].function.name == "get_weather"
-        assert chunks[-1].choices[0].finish_reason == "tool_calls"
-
-
-async def test_invalid_tool_repair_once_and_no_unvalidated_output(make_client):
-    bad = '{"type":"tool_call","name":"get_weather","arguments":{"city":123}}'
-    backend = FakeBackend([[bad], [CALL], [bad], [bad]])
-    http, _, _ = make_client(backend)
-    async with http:
-        result = await http.post("/v1/chat/completions", json=BASIC | {"tools": [TOOL]})
-        assert result.status_code == 200
-        assert len(backend.prompts) == 2
-        assert "Previous invalid response" in backend.prompts[1]
-        result = await http.post(
-            "/v1/chat/completions", json=BASIC | {"tools": [TOOL], "stream": True}
-        )
-        assert result.status_code == 502
-        assert result.json()["error"]["code"] == "invalid_tool_output"
-        assert len(backend.prompts) == 4
-        assert "123" not in result.text
-
-
-async def test_isolation_role_serialization_and_no_tools_mode(make_client):
+async def test_isolation_and_disabled_tools(make_client):
     http, _, backend = make_client(FakeBackend([["one"], ["two"]]))
     async with http:
         first = BASIC | {
@@ -356,7 +293,7 @@ async def test_disconnect_after_first_streamed_content(make_client):
     await http.aclose()
 
 
-async def test_logs_do_not_contain_prompt_or_tool_output(make_client, caplog):
+async def test_logs_do_not_contain_prompt_or_response(make_client, caplog):
     import logging
 
     backend = FakeBackend([["PRIVATE_OUTPUT", ProxyError("upstream_protocol", "Failed")]])

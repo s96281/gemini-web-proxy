@@ -4,6 +4,7 @@ import os
 import uuid
 
 from .errors import ProxyError
+from .prompts import INSTRUCTION_ROLES, PROMPT_MODE
 from .schema import Message
 
 
@@ -27,13 +28,14 @@ class Conversations:
         self.entries = json.loads(path.read_text()) if path.exists() else {}
 
     def resolve(self, request):
-        hashes = fingerprints(request.messages)
+        hashes = fingerprints([m for m in request.messages if m.role not in INSTRUCTION_ROLES])
         entry = self.entries.get(request.conversation_id) if request.conversation_id else None
         if entry is None and not request.conversation_id:
             matches = [
                 (key, value)
                 for key, value in self.entries.items()
-                if value["model"] == request.model
+                if value.get("prompt_mode") == PROMPT_MODE
+                and value["model"] == request.model
                 and len(hashes) > len(value["hashes"])
                 and hashes[: len(value["hashes"])] == value["hashes"]
             ]
@@ -44,6 +46,12 @@ class Conversations:
             if matches:
                 request.conversation_id, entry = matches[0]
         if entry is not None:
+            if entry.get("prompt_mode") != PROMPT_MODE:
+                raise ProxyError(
+                    "conversation_mode_changed",
+                    "This thread used structured prompts. Use a new conversation_id for passthrough.",
+                    409,
+                )
             if not entry["valid"]:
                 raise ProxyError(
                     "conversation_uncertain",

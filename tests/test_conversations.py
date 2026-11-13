@@ -1,11 +1,9 @@
-import json
-
 import pytest
 
 from gemini_proxy.errors import ProxyError
 
 from .conftest import FakeBackend
-from .test_api import BASIC, CALL, TOOL
+from .test_api import BASIC
 
 URL = "/v1/chat/completions"
 
@@ -133,36 +131,6 @@ async def test_browser_thread_stays_on_browser_when_cookie_recovers(make_client)
         result = await http.post(URL, json=followup(BASIC, first.json()["choices"][0]["message"]))
     assert result.status_code == 200
     assert browser.states == [{}, {"turn": 1}] and not cookie.prompts
-
-
-async def test_tool_result_continues_after_format_repair(make_client):
-    backend = FakeBackend([["invalid"], [CALL], ['{"type":"text","content":"done"}']])
-    http, _, _ = make_client(backend)
-    body = BASIC | {"tools": [TOOL], "tool_choice": "required"}
-    async with http:
-        first = await http.post(URL, json=body)
-        message = first.json()["choices"][0]["message"]
-        call_id = message["tool_calls"][0]["id"]
-        result = await http.post(
-            URL,
-            json=body
-            | {
-                "tool_choice": "auto",
-                "messages": body["messages"]
-                + [
-                    message,
-                    {
-                        "role": "tool",
-                        "content": "weather result",
-                        "tool_call_id": call_id,
-                    },
-                ],
-            },
-        )
-    assert result.status_code == 200
-    assert backend.states == [{}, {"turn": 1}, {"turn": 2}]
-    history = json.loads(backend.prompts[2].split("Conversation JSON:\n")[1])
-    assert len(history) == 1 and history[0]["role"] == "tool"
 
 
 async def test_conversation_cache_is_bounded(make_client, settings):
